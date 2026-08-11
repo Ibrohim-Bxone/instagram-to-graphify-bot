@@ -72,7 +72,7 @@ Results are written to two places:
 ### Installation
 
 ```bash
-git clone https://github.com/<your-username>/instagram-to-graphify-bot.git
+git clone https://github.com/Ibrohim-Bxone/instagram-to-graphify-bot.git
 cd instagram-to-graphify-bot
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt   # Windows
@@ -90,6 +90,42 @@ Copy `.env.example` to `.env` and fill it in:
 ```bash
 copy .env.example .env
 ```
+
+#### Deploying with an AI coding assistant
+
+Don't want to do the setup by hand? Paste this into Claude Code, Cursor, or any
+AI coding assistant with terminal access, in the folder where you want the
+project:
+
+````text
+Clone and deploy https://github.com/Ibrohim-Bxone/instagram-to-graphify-bot
+on this machine. Steps:
+
+1. Clone the repo, create a Python 3.11+ venv, install requirements.txt.
+2. Check whether Ollama is installed (`ollama --version`). If not, tell me to
+   install it from https://ollama.com and stop until I confirm it's done.
+   Then run `ollama pull gemma4:12b` (~7.6GB download).
+3. Detect whether an NVIDIA GPU is present. If yes, additionally install
+   nvidia-cublas-cu12 and nvidia-cudnn-cu12 into the venv for faster
+   transcription.
+4. Copy .env.example to .env. Ask me for BOT_TOKEN (I'll get it from
+   @BotFather on Telegram) and ALLOWED_USER_IDS (I'll get my numeric ID from
+   @userinfobot on Telegram) and fill those two into .env — leave every other
+   variable at its default.
+5. Run `python -m scripts.doctor` and fix anything it reports as FAIL before
+   proceeding — don't just tell me about it, actually resolve it (missing
+   model, wrong path, etc.) and re-run doctor until everything passes.
+6. Start the bot (`python -m src.bot`) and confirm in the logs that it's
+   polling Telegram with no errors.
+7. Tell me to open Telegram, message the bot /start, and send it one
+   Instagram/YouTube link to confirm the full pipeline works end to end.
+
+Ask me one question at a time when you need something from me (the bot token,
+confirming Ollama is installed, etc.) — don't guess or skip a step.
+````
+
+This works because every step above matches an actual command in this
+project — the AI doesn't need to guess anything.
 
 ### Configuration (`.env`)
 
@@ -304,7 +340,7 @@ Natija ikki joyga yoziladi:
 ### O'rnatish
 
 ```bash
-git clone https://github.com/<sizning-username>/instagram-to-graphify-bot.git
+git clone https://github.com/Ibrohim-Bxone/instagram-to-graphify-bot.git
 cd instagram-to-graphify-bot
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt   # Windows
@@ -322,6 +358,44 @@ lekin sezilarli tezlashtiradi):
 ```bash
 copy .env.example .env
 ```
+
+#### AI yordamchi orqali deploy qilish
+
+Qo'lda sozlashni xohlamasangiz — quyidagini Claude Code, Cursor yoki terminalga
+kira oladigan istalgan AI yordamchiga, loyihani joylashtirmoqchi bo'lgan
+papkada, to'g'ridan-to'g'ri nusxalab bering:
+
+````text
+https://github.com/Ibrohim-Bxone/instagram-to-graphify-bot ni shu kompyuterda
+klonlab, ishga tushiring. Bosqichlar:
+
+1. Repo'ni klonlang, Python 3.11+ venv yarating, requirements.txt'ni o'rnating.
+2. Ollama o'rnatilganini tekshiring (`ollama --version`). O'rnatilmagan bo'lsa,
+   https://ollama.com dan o'rnatishimni so'rang va men tasdiqlaguncha
+   to'xtang. Keyin `ollama pull gemma4:12b` (~7.6GB) ni ishga tushiring.
+3. NVIDIA GPU bor-yo'qligini aniqlang. Bo'lsa, transkripsiyani tezlashtirish
+   uchun venv'ga qo'shimcha nvidia-cublas-cu12 va nvidia-cudnn-cu12'ni
+   o'rnating.
+4. .env.example'ni .env'ga nusxalang. Mendan BOT_TOKEN (Telegram'dagi
+   @BotFather'dan olaman) va ALLOWED_USER_IDS (Telegram'dagi @userinfobot'dan
+   raqamli ID'imni olaman) so'rang va shu ikkitasini .env'ga yozing — qolgan
+   hamma narsa standart holida qolsin.
+5. `python -m scripts.doctor` ni ishga tushiring va FAIL deb chiqqan hamma
+   narsani tuzating — shunchaki aytib qo'ymang, haqiqatan hal qiling (model
+   yetishmasa, yo'l noto'g'ri bo'lsa va h.k.) va hammasi o'tguncha qayta-qayta
+   ishga tushiring.
+6. Botni ishga tushiring (`python -m src.bot`) va log'da Telegram'ga xatosiz
+   ulanganini tasdiqlang.
+7. Menga Telegram'da botga /start yozib, keyin bitta Instagram/YouTube
+   linkini tashlab, butun jarayon oxirigacha ishlashini tekshirishni ayting.
+
+Sizga kerak bo'lgan narsani (bot token, Ollama o'rnatilganini tasdiqlash va
+h.k.) bir vaqtda bittadan so'rang — hech narsani taxmin qilib o'tkazib
+yubormang.
+````
+
+Bu ishlaydi, chunki yuqoridagi har bir qadam ushbu loyihadagi aniq buyruqqa mos
+keladi — AI hech narsani taxmin qilishi shart emas.
 
 ### Sozlash (`.env`)
 
