@@ -58,7 +58,7 @@ alohida update qilib yuboradi, "oxirgisi shu" degan belgi bermaydi.
 
 ## VRAM
 
-RTX 4060, 8GB. whisper large-v3 (~3GB) va gemma4:12b (~7.6GB) birga sig'maydi.
+8GB VRAM'li GPU'da whisper large-v3 (~3GB) va gemma4:12b (~7.6GB) birga sig'maydi.
 `transcribe.unload()` Ollama chaqirilishidan oldin majburiy. Worker ketma-ket
 ishlaydi — parallel qilmang.
 
