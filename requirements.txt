@@ -1,0 +1,19 @@
+aiogram==3.15.0
+python-dotenv==1.0.1
+requests==2.32.3
+# Not pinned tight: Instagram breaks yt-dlp's extractor often enough that an old
+# pin causes real download failures. Run `pip install -U yt-dlp` if links stop
+# working — see README's troubleshooting note.
+yt-dlp>=2026.7.4
+faster-whisper==1.1.1
+imageio-ffmpeg==0.5.1
+Pillow==11.1.0
+# Pinned to the version Graphify's venv already uses — the bot writes into the
+# same ChromaDB file, and mixing client versions on one SQLite store is unsafe.
+chromadb==1.5.9
+pytest==8.3.4
+
+# CTranslate2 needs these to use the GPU; without them whisper falls back to CPU.
+# Drop both lines on a machine without an NVIDIA card.
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
