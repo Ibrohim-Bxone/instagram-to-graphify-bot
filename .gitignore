@@ -7,3 +7,4 @@ __pycache__/
 tests/fixtures/*.mp4
 .pytest_cache/
 .claude/settings.local.json
+*.lnk

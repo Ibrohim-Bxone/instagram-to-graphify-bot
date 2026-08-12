@@ -182,6 +182,34 @@ This checks ffmpeg, whisper (GPU/CPU), Ollama models, the knowledge-base
 backend, the archive folder, and Telegram config — and tells you exactly
 what's missing.
 
+#### Auto-start on boot (Windows)
+
+To have the bot start automatically every time you log in, and restart itself
+if it ever crashes:
+
+```powershell
+$proj = (Get-Location).Path
+$startup = [Environment]::GetFolderPath("Startup")
+$wsh = New-Object -ComObject WScript.Shell
+$shortcut = $wsh.CreateShortcut((Join-Path $startup "InstagramGraphifyBot.lnk"))
+$shortcut.TargetPath = "$proj\.venv\Scripts\pythonw.exe"
+$shortcut.Arguments = "-m scripts.watchdog"
+$shortcut.WorkingDirectory = $proj
+$shortcut.WindowStyle = 7
+$shortcut.Save()
+```
+
+This drops a shortcut into your Startup folder that runs `scripts/watchdog.py`
+— a small supervisor that launches the bot windowlessly and relaunches it
+immediately if it ever exits, logging each restart to `data/logs/watchdog.log`.
+(Windows Task Scheduler is the "proper" way to do this, but it's often locked
+down by corporate/domain group policy — a Startup-folder shortcut needs no
+elevated permissions and works everywhere.)
+
+Messages sent while the bot was offline are not lost: Telegram holds them
+server-side until the bot reconnects and processes them in order, so nothing
+needs to be resent.
+
 ### Usage (Telegram commands)
 
 Start with `/start`. Then:
@@ -452,6 +480,35 @@ Ishga tushirishdan oldin hamma narsa sozlanganini tekshirish uchun:
 
 Bu ffmpeg, whisper (GPU/CPU), Ollama modellar, bilim bazasi backend'i, arxiv
 papkasi va Telegram sozlamalarini tekshirib, aniq nima yetishmayotganini aytadi.
+
+#### Kompyuter yoqilganda avtomatik ishga tushirish (Windows)
+
+Har safar login qilganingizda bot avtomatik ishga tushishi va qulab tushsa
+o'zi qayta ko'tarilishi uchun:
+
+```powershell
+$proj = (Get-Location).Path
+$startup = [Environment]::GetFolderPath("Startup")
+$wsh = New-Object -ComObject WScript.Shell
+$shortcut = $wsh.CreateShortcut((Join-Path $startup "InstagramGraphifyBot.lnk"))
+$shortcut.TargetPath = "$proj\.venv\Scripts\pythonw.exe"
+$shortcut.Arguments = "-m scripts.watchdog"
+$shortcut.WorkingDirectory = $proj
+$shortcut.WindowStyle = 7
+$shortcut.Save()
+```
+
+Bu Windows'ning Startup papkasiga bir yorliq qo'yadi — u `scripts/watchdog.py`
+(kichik "nazoratchi" skript)ni ishga tushiradi. Bu skript botni oynasiz ishga
+tushiradi va u qulab tushsa (yoki har qanday sababdan chiqib ketsa) darhol
+qayta ko'taradi, har bir qayta tushirishni `data/logs/watchdog.log`ga yozadi.
+(Windows Task Scheduler — "rasmiy" yo'l, lekin ko'pincha korporativ domen
+siyosati uni cheklab qo'yadi — Startup papkasi yorlig'i hech qanday maxsus
+huquq talab qilmaydi va hamma joyda ishlaydi.)
+
+Bot o'chiq turgan paytda yuborilgan xabarlar yo'qolmaydi: Telegram ularni
+o'z serverida saqlab turadi, bot qayta ulanishi bilan ularni tartib bilan
+qayta ishlaydi — qayta yuborish shart emas.
 
 ### Foydalanish (Telegram buyruqlari)
 

@@ -67,3 +67,13 @@ ishlaydi — parallel qilmang.
 Prompt yoki model o'zgartirsangiz, `scripts/batch.py` bilan bir xil test
 to'plamida o'lchang: vaqt, `items` soni, `verified` ulushi, `usable` ulushi.
 Telegram orqali bittalab sinash — vaqt isrofi.
+
+## Avtomatik ishga tushirish (`scripts/watchdog.py`)
+
+Windows Task Scheduler orqali qilinmagan — sinab ko'rilgan, korporativ domen
+siyosati (`Register-ScheduledTask`/`schtasks` ikkalasi ham) "Access is denied"
+bilan bloklagan (2026-08-12). Yechim: Startup papkasiga yorliq (hech qanday
+maxsus huquq talab qilmaydi) + `scripts/watchdog.py` — bot jarayonini
+`subprocess.Popen().wait()` bilan kuzatib, chiqib ketgan zahoti qayta ishga
+tushiradi. Bu ataylab tashqi kutubxonasiz (masalan NSSM) qilingan — loyihaning
+"minimal tashqi bog'liqlik" falsafasiga mos.
