@@ -1,17 +1,41 @@
 """Getting the video: Instagram link via yt-dlp, or a file sent straight to the bot."""
 
+import hashlib
 import random
 import re
 import time
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from . import config
 
 _SHORTCODE_RE = re.compile(
-    r"instagram\.com/(?:[^/]+/)?(?:reels?|p|tv|stories/[^/]+)/([A-Za-z0-9_-]+)", re.IGNORECASE
+    r"https?://(?:[A-Za-z0-9-]+\.)*instagram\.com/(?:[^/]+/)?"
+    r"(?:reels?|p|tv|stories/[^/]+)/([A-Za-z0-9_-]+)", re.IGNORECASE
 )
-_YOUTUBE_RE = re.compile(r"(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)([A-Za-z0-9_-]{6,})", re.IGNORECASE)
-URL_RE = re.compile(r"https?://(?:\S*(?:instagram\.com|youtube\.com|youtu\.be)/\S+)", re.IGNORECASE)
+# Anchored at the scheme for the same reason as URL_RE below: without it,
+# notyoutube.com/watch?v=X and evil.ru/?u=instagram.com/p/X would hand back a
+# real video's id, and that id is the archive filename and KB row prefix.
+_YOUTUBE_RE = re.compile(
+    r"https?://(?:[A-Za-z0-9-]+\.)*(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)"
+    r"([A-Za-z0-9_-]{6,})", re.IGNORECASE)
+
+# yt-dlp already handles ~1800 sites; the bot only has to recognise a link as
+# "video" to route it there. The host list stays explicit rather than "any URL"
+# because a forwarded post that merely contains a link must keep going down the
+# text path — /video forces the video pipeline for anything not listed here.
+MEDIA_HOSTS = [
+    "instagram.com", "youtube.com", "youtu.be", "tiktok.com", "vt.tiktok.com",
+    "twitter.com", "x.com", "reddit.com", "facebook.com", "fb.watch",
+    "vimeo.com", "twitch.tv", "dailymotion.com", "threads.net", "threads.com",
+    "pinterest.com", "pin.it", "linkedin.com", "bilibili.com", "rutube.ru",
+    "vk.com", "ok.ru", "soundcloud.com", "kick.com", "streamable.com",
+]
+_HOST_ALT = "|".join(h.replace(".", r"\.") for h in MEDIA_HOSTS)
+# The host must sit directly after the scheme, optionally behind subdomains —
+# matching it as a loose substring would pull in dropbox.com (contains box.com,
+# which contains x.com), mailbox.com and notyoutube.com.
+URL_RE = re.compile(rf"https?://(?:[A-Za-z0-9-]+\.)*(?:{_HOST_ALT})(?:[:/]\S*)?", re.IGNORECASE)
 ANY_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 def extract_links(text: str) -> list:
@@ -19,7 +43,7 @@ def extract_links(text: str) -> list:
     verbatim in the record so the entry stays actionable later."""
     seen, out = set(), []
     for m in ANY_URL_RE.finditer(text or ""):
-        url = m.group(0).rstrip(".,;)")
+        url = m.group(0).rstrip(".,;:!?)]}>\"'«»")
         if url not in seen:
             seen.add(url)
             out.append(url)
@@ -27,18 +51,62 @@ def extract_links(text: str) -> list:
 
 
 def shortcode_from_url(url: str) -> str | None:
-    m = _SHORTCODE_RE.search(url) or _YOUTUBE_RE.search(url)
-    return m.group(1) if m else None
+    """A stable, filename-safe id for the post behind `url`.
+
+    Instagram and YouTube keep their native ids so existing archive entries stay
+    addressable. Every other host falls back to slug+hash: the slug keeps the
+    filename readable, the hash keeps two posts with the same trailing segment
+    (`/video/`, `/p/`) from colliding.
+    """
+    # Matched against the canonical form, not the raw one: it puts `v=` back
+    # first on `watch?app=desktop&v=XYZ`, and it percent-encodes a whole URL
+    # smuggled through a redirect wrapper's query so it can no longer pose as
+    # the id of the video it names.
+    canonical = clean_url(url)
+    m = _SHORTCODE_RE.search(canonical) or _YOUTUBE_RE.search(canonical)
+    if m:
+        return m.group(1)
+
+    parsed = urlsplit(canonical)
+    if not parsed.netloc:
+        return None
+    host = parsed.netloc.removeprefix("www.").split(".")[0]
+    slug = re.sub(r"[^A-Za-z0-9_-]", "", parsed.path.rsplit("/", 1)[-1])[:24]
+    # Hashing the canonical form (query included) is what keeps ?id=1 and ?id=2
+    # apart while still collapsing the same page shared with different tracking.
+    digest = hashlib.sha1(canonical.encode()).hexdigest()[:6]
+    return "-".join(p for p in (host, slug, digest) if p)
 
 def is_youtube_url(url: str) -> bool:
     return bool(re.search(r"(?:youtube\.com|youtu\.be)/", url, re.IGNORECASE))
 
 
+_TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "igsh", "igshid", "si", "fbclid", "gclid", "ref", "ref_src", "ref_url",
+    "share_id", "share_app_id", "spm", "_r", "_t", "feature", "app", "pp",
+    "source", "epa", "sfnsn", "mibextid", "rdt", "web_copy_link",
+}
+
+
 def clean_url(url: str) -> str:
-    """Drop tracking query params so the same reel always yields the same job id."""
+    """Canonical form: tracking params and fragment dropped, meaning kept.
+
+    Two links must produce the same string exactly when they point at the same
+    content, because this string is what the shortcode (archive filename, KB row
+    prefix) and the queue id are derived from. That rules out dropping the query
+    wholesale: `?id=1` and `?id=2` are different articles, while a bare `&`-split
+    loses the `v=` on `youtube.com/watch?app=desktop&v=XYZ`.
+    """
+    parsed = urlsplit(url.strip())
+    kept = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+            if k.lower() not in _TRACKING_PARAMS]
     if is_youtube_url(url):
-        return url.split("&")[0].rstrip("/")
-    return url.split("?")[0].rstrip("/")
+        # `v` alone identifies the video; playlist/timestamp params only split ids.
+        kept = [(k, v) for k, v in kept if k == "v"]
+    path = parsed.path.rstrip("/")
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path,
+                       urlencode(kept), ""))
 
 
 class DownloadError(RuntimeError):
@@ -67,10 +135,12 @@ def download(url: str, shortcode: str) -> dict:
 
     time.sleep(random.uniform(1.0, 3.0))
     try:
-        with yt_dlp.YoutubeDL({**common, "skip_download": True}) as ydl:
+        with yt_dlp.YoutubeDL({**common, "skip_download": True, "ignore_no_formats_error": True}) as ydl:
             raw = ydl.extract_info(url, download=False, process=False)
     except Exception as e:
         raise DownloadError(str(e)) from e
+    if not raw:
+        raise DownloadError("Instagram post metadata could not be retrieved")
 
     entries = list(raw.get("entries") or [raw])
     photo_paths = []
@@ -122,6 +192,59 @@ def download(url: str, shortcode: str) -> dict:
         "duration": raw.get("duration") or 0,
         "webpage_url": raw.get("webpage_url") or url,
     }
+
+def is_bare_link(text: str) -> bool:
+    """Is this message just a link the user wants analysed?
+
+    A forwarded post usually carries its own body text around the link and must
+    keep going down the text path — only a message that is essentially nothing
+    but a URL means "go read this page for me".
+    """
+    stripped = (text or "").strip()
+    m = ANY_URL_RE.fullmatch(stripped)
+    return bool(m)
+
+
+class ArticleError(RuntimeError):
+    pass
+
+
+def fetch_article(url: str) -> dict:
+    """Read a web page (habr, a blog, docs) down to its article text.
+
+    Kept separate from download(): there is no media, so the pipeline skips
+    transcription and vision entirely and extracts straight from the text.
+    """
+    import trafilatura
+
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; IdeaBot/1.0)"}
+    try:
+        import requests
+        response = requests.get(url, headers=headers, timeout=45)
+        response.raise_for_status()
+        html = response.text
+    except Exception as e:
+        raise ArticleError(f"sahifani ochib bo'lmadi: {e}") from e
+
+    text = trafilatura.extract(html, include_comments=False, include_tables=True,
+                               favor_precision=True) or ""
+    if len(text.strip()) < 200:
+        raise ArticleError("sahifada o'qiladigan matn topilmadi (paywall, JS, yoki bo'sh)")
+
+    meta = trafilatura.extract_metadata(html)
+    title = getattr(meta, "title", "") or ""
+    author = getattr(meta, "author", "") or getattr(meta, "sitename", "") or ""
+
+    # Titles are worth keeping in the body: extract() drops the <h1>, and the
+    # title is often the single most informative line on the page.
+    caption = f"{title}\n\n{text}".strip() if title else text.strip()
+    return {
+        "video_path": None, "photo_paths": [],
+        "caption": caption,
+        "uploader": author, "title": title, "duration": 0,
+        "webpage_url": url,
+    }
+
 
 def adopt_text(text: str, shortcode: str) -> dict:
     """A forwarded Telegram post with no media — text (and usually a link) only."""

@@ -15,6 +15,10 @@ def _ids(raw: str) -> set:
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ALLOWED_USER_IDS = _ids(os.getenv("ALLOWED_USER_IDS", ""))
+# Admins can add/remove users and are the only ones who may run /install.
+# Unset means "whoever was already trusted in .env", which keeps a single-user
+# install working unchanged; an explicit list is what separates the two tiers.
+ADMIN_USER_IDS = _ids(os.getenv("ADMIN_USER_IDS", "")) or set(ALLOWED_USER_IDS)
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 MODEL_EXTRACT = os.getenv("MODEL_EXTRACT", "gemma4:12b")
@@ -24,6 +28,9 @@ OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 # context (e.g. 32768) pushes part of the model onto the CPU and makes every
 # call several times slower. Raise only if a transcript is routinely truncated.
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
+# 4096 output tokens is enough for full extraction JSON schemas; without an
+# explicit budget Ollama cuts generation early with done_reason="length".
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "4096"))
 
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto")
@@ -58,6 +65,26 @@ STANDALONE_KB_DIR = DATA_DIR / "kb_db"
 PROJECT_LABEL = os.getenv("PROJECT_LABEL", "Promtlarim")
 
 YTDLP_COOKIES_FROM_BROWSER = os.getenv("YTDLP_COOKIES_FROM_BROWSER", "").strip()
+
+# Telegram's cloud Bot API refuses to serve any file larger than 20MB, whatever
+# the bot does. Pointing this at a self-hosted Bot API server
+# (github.com/tdlib/telegram-bot-api) raises the ceiling to 2GB; in that mode
+# get_file returns an absolute path on disk instead of a download URL, so the
+# file is moved into place rather than fetched over HTTP.
+TELEGRAM_API_BASE = os.getenv("TELEGRAM_API_BASE", "").strip().rstrip("/")
+TELEGRAM_API_LOCAL = bool(TELEGRAM_API_BASE)
+CLOUD_FILE_LIMIT = 20 * 1024 * 1024
+
+
+# /install runs real commands on this machine, driven by text that came off the
+# internet — so it is opt-in, allow-listed to four installers, and always asks
+# for confirmation showing the exact argv first. See src/installer.py.
+# Both targets stay inside data/ by default: nothing lands anywhere that another
+# tool reads automatically unless the user names that path themselves.
+INSTALL_ENABLED = os.getenv("INSTALL_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
+TOOLS_DIR = Path(os.getenv("TOOLS_DIR", "") or (DATA_DIR / "tools"))
+SKILLS_DIR = Path(os.getenv("SKILLS_DIR", "") or (DATA_DIR / "skills"))
+INSTALL_TIMEOUT_SEC = int(os.getenv("INSTALL_TIMEOUT_SEC", "600"))
 
 for _d in (DATA_DIR, MEDIA_DIR, LOG_DIR, ARCHIVE_DIR):
     _d.mkdir(parents=True, exist_ok=True)
