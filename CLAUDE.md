@@ -77,3 +77,20 @@ maxsus huquq talab qilmaydi) + `scripts/watchdog.py` — bot jarayonini
 `subprocess.Popen().wait()` bilan kuzatib, chiqib ketgan zahoti qayta ishga
 tushiradi. Bu ataylab tashqi kutubxonasiz (masalan NSSM) qilingan — loyihaning
 "minimal tashqi bog'liqlik" falsafasiga mos.
+
+## Soqchi (`soqchi.py`) — osilib qolgan ish kuzatuvchisi
+
+Bot ishchisi ketma-ket (VRAM cheklovi), shuning uchun bitta osilgan ish butun
+navbatni to'xtatadi. `soqchi.py` mustaqil jarayon: har `--kutish` soniyada
+bazani tekshiradi, `--chegara` daqiqadan ortiq qimirlamagan `running` ishni
+`failed` qiladi (qayta navbatga QO'YMAYDI — aks holda loop qaytadi).
+
+2026-09-03 sinovda haqiqiy stuck ishni to'g'ri topdi (35 daq qotgan whisper) va
+sekin-lekin-ishlab-turgan ishga tegmadi (25 daq, aslida `extracting`ga o'tgan edi).
+
+**Bot bilan bir xil naqshda avtomatik ishga tushadi:** Startup papkasida
+`InstagramGraphifySoqchi.lnk` (`pythonw.exe soqchi.py --kutish 600 --chegara 30`,
+`scripts/watchdog.py`ning `InstagramGraphifyBot.lnk` yorlig'i bilan bir xil
+konvensiya). Osilgan Python oqimini o'ldira olmaydi — faqat baza yozuvini
+tuzatadi; bloklangan oqim baribir botni qayta ishga tushirishni talab qilishi
+mumkin (skript bu haqda ochiq ogohlantiradi).

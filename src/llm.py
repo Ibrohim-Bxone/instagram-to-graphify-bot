@@ -25,10 +25,12 @@ class TruncatedResponseError(LLMError):
 
 
 def chat(model: str, messages: list, schema: dict | None = None,
-         images: list | None = None, timeout: int = 1800,
+         images: list | None = None, timeout: int | None = None,
          num_predict: int | None = None, num_ctx: int | None = None) -> str:
     """One chat turn. `schema` uses Ollama's structured-output mode: without it a
     12B model reliably breaks JSON with stray prose or trailing commas."""
+    if timeout is None:
+        timeout = config.LLM_TIMEOUT_DEFAULT
     if images:
         messages = list(messages)
         messages[-1] = dict(messages[-1])

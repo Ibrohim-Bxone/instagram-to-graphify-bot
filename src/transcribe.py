@@ -53,7 +53,8 @@ def extract_audio(video_path: Path) -> Path | None:
     audio = video_path.with_suffix(".wav")
     cmd = [ffmpeg_exe(), "-y", "-i", str(video_path),
            "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", str(audio)]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    # No timeout here used to hang the single worker forever on a corrupt file.
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=config.FFMPEG_TIMEOUT_SEC)
     if proc.returncode != 0 or not audio.exists():
         # Video-only muxers do not all use the same ffmpeg error wording.
         has_audio_stream = re.search(r"Stream #\d+:\d+.*\bAudio:", proc.stderr, re.IGNORECASE | re.DOTALL)

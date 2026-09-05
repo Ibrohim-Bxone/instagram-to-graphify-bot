@@ -29,7 +29,11 @@ def _hamming(a: int, b: int) -> int:
 
 
 def _run(cmd: list) -> bool:
-    return subprocess.run(cmd, capture_output=True, text=True).returncode == 0
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=config.FFMPEG_TIMEOUT_SEC).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
 
 
 def extract_frames(video_path: Path, max_frames: int | None = None) -> list:

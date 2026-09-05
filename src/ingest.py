@@ -1,13 +1,18 @@
 """Getting the video: Instagram link via yt-dlp, or a file sent straight to the bot."""
 
 import hashlib
+import ipaddress
+import logging
 import random
 import re
+import socket
 import time
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from . import config
+
+log = logging.getLogger("ingest")
 
 _SHORTCODE_RE = re.compile(
     r"https?://(?:[A-Za-z0-9-]+\.)*instagram\.com/(?:[^/]+/)?"
@@ -144,6 +149,7 @@ def download(url: str, shortcode: str) -> dict:
 
     entries = list(raw.get("entries") or [raw])
     photo_paths = []
+    flags = []
     for index, entry in enumerate(entries, 1):
         if not entry or entry.get("formats") or not entry.get("thumbnails"):
             continue
@@ -174,6 +180,8 @@ def download(url: str, shortcode: str) -> dict:
         except Exception as e:
             if not photo_paths:
                 raise DownloadError(str(e)) from e
+            log.warning("carousel video download failed: %s", e)
+            flags.append("carousel_video_failed")
 
     videos = sorted(p for p in out_dir.glob("video-*")
                     if p.suffix != ".part" and p.is_file())
@@ -191,6 +199,7 @@ def download(url: str, shortcode: str) -> dict:
         "title": (raw.get("title") or "").strip(),
         "duration": raw.get("duration") or 0,
         "webpage_url": raw.get("webpage_url") or url,
+        "flags": flags,
     }
 
 def is_bare_link(text: str) -> bool:
@@ -209,6 +218,78 @@ class ArticleError(RuntimeError):
     pass
 
 
+def _reject_private_url(url: str) -> None:
+    """Refuse URLs that resolve inside this machine or the local network.
+
+    Members are trusted, but a link is not: a pasted http://localhost:11434
+    or http://169.254.169.254 would make the bot fetch its own Ollama or a
+    cloud metadata endpoint and hand the body back in a Telegram message.
+    Every resolved address is checked, not just the first - a hostname can
+    map to both a public and a private one.
+    """
+    if config.ALLOW_PRIVATE_URLS:
+        return
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        raise ArticleError(f"faqat http/https qo'llab-quvvatlanadi: {parts.scheme or '?'}")
+    host = parts.hostname or ""
+    if not host:
+        raise ArticleError("havolada domen yo'q")
+    try:
+        infos = socket.getaddrinfo(host, parts.port or (443 if parts.scheme == "https" else 80))
+    except OSError as e:
+        raise ArticleError(f"domen topilmadi: {host}") from e
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            raise ArticleError(f"ichki tarmoq manzili rad etildi: {host} -> {ip}")
+
+
+def _fetch_html(url: str, headers: dict) -> str:
+    """Fetch a page body, validating EVERY hop and capping the size.
+
+    Redirects are followed by hand. requests follows them itself, which would
+    make the guard useless: a public URL answering 302 Location:
+    http://127.0.0.1:11434 lands straight on the private address that
+    _reject_private_url was there to stop.
+    """
+    import requests
+
+    current = url
+    with requests.Session() as session:
+        for _ in range(config.ARTICLE_MAX_REDIRECTS):
+            _reject_private_url(current)
+            response = session.get(current, headers=headers, timeout=45,
+                                   stream=True, allow_redirects=False)
+            # `with` on the response: raising mid-stream below would otherwise
+            # leave the socket open and unusable by the connection pool.
+            with response:
+                if response.is_redirect or response.is_permanent_redirect:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise ArticleError("yo'naltirishda manzil yo'q")
+                    current = urljoin(current, location)
+                    continue
+                response.raise_for_status()
+                chunks, total = [], 0
+                for chunk in response.iter_content(64 * 1024):
+                    total += len(chunk)
+                    if total > config.ARTICLE_MAX_BYTES:
+                        raise ArticleError(
+                            f"sahifa juda katta "
+                            f"(>{config.ARTICLE_MAX_BYTES // (1024 * 1024)} MB)")
+                    chunks.append(chunk)
+                # requests falls back to ISO-8859-1 for any text/* without an
+                # explicit charset, so `response.encoding or "utf-8"` never
+                # reaches utf-8 and Uzbek text comes back as mojibake.
+                content_type = response.headers.get("content-type", "")
+                encoding = (response.encoding if "charset=" in content_type.lower()
+                            else None) or "utf-8"
+                return b"".join(chunks).decode(encoding, errors="replace")
+    raise ArticleError("juda ko'p yo'naltirish")
+
+
 def fetch_article(url: str) -> dict:
     """Read a web page (habr, a blog, docs) down to its article text.
 
@@ -219,10 +300,9 @@ def fetch_article(url: str) -> dict:
 
     headers = {"User-Agent": "Mozilla/5.0 (compatible; IdeaBot/1.0)"}
     try:
-        import requests
-        response = requests.get(url, headers=headers, timeout=45)
-        response.raise_for_status()
-        html = response.text
+        html = _fetch_html(url, headers)
+    except ArticleError:
+        raise
     except Exception as e:
         raise ArticleError(f"sahifani ochib bo'lmadi: {e}") from e
 

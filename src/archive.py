@@ -7,6 +7,7 @@ extraction record as JSON, not just the prose rendering of it.
 """
 
 import json
+import os
 import re
 from datetime import date
 from pathlib import Path
@@ -57,7 +58,10 @@ def render(record: dict) -> str:
                 mark = ""  # verbatim-fidelity is only meaningful for quoted prompts
             else:
                 mark = "✅ so'zma-so'z" if item.get("verified") else "⚠️ tasdiqlanmagan"
-            lines += [f"### {i}. {item.get('name_en', '?')} — `{item.get('kind', '?')}` {mark}",
+            label = item.get("kind", "?")
+            if item.get("subtype"):
+                label += f" / {item['subtype']}"
+            lines += [f"### {i}. {item.get('name_en', '?')} — `{label}` {mark}",
                       "", "```text", item.get("content", "").strip(), "```", ""]
             if item.get("note_uz"):
                 lines += [f"_Izoh:_ {item['note_uz']}", ""]
@@ -86,7 +90,16 @@ def render(record: dict) -> str:
 def write(record: dict) -> Path:
     record.setdefault("date", date.today().isoformat())
     p = path_for(record["shortcode"])
-    p.write_text(render(record), encoding="utf-8")
+    tmp_path = p.with_suffix(".tmp")
+    try:
+        tmp_path.write_text(render(record), encoding="utf-8")
+        os.replace(tmp_path, p)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     return p
 
 

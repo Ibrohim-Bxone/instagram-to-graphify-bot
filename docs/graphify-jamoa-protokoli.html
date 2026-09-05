@@ -1,0 +1,491 @@
+<title>Graphify Jamoa Protokoli</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --ground:      #F6F7F9;
+    --surface:     #FFFFFF;
+    --surface-alt: #ECEEF2;
+    --ink:         #171A21;
+    --ink-soft:    #4E5563;
+    --ink-faint:   #808896;
+    --line:        #DEE1E7;
+    --line-strong: #C4C9D2;
+    --accent:      #8C2F39;
+    --accent-soft: #F6E9EA;
+    --local:       #226B66;
+    --local-soft:  #E2F0EE;
+    --code-bg:     #1B1F27;
+    --code-ink:    #DDE2EA;
+
+    --display: "Newsreader", "Iowan Old Style", Georgia, serif;
+    --body: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    --measure: 66ch;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #13161C;
+      --surface:     #1B1F27;
+      --surface-alt: #232833;
+      --ink:         #E7E9EE;
+      --ink-soft:    #A7AEBC;
+      --ink-faint:   #7C8493;
+      --line:        #2C323E;
+      --line-strong: #3D4552;
+      --accent:      #DE8A93;
+      --accent-soft: #2E1B1E;
+      --local:       #63BDB6;
+      --local-soft:  #152C2A;
+      --code-bg:     #0E1116;
+      --code-ink:    #D5DBE4;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground:      #13161C;
+    --surface:     #1B1F27;
+    --surface-alt: #232833;
+    --ink:         #E7E9EE;
+    --ink-soft:    #A7AEBC;
+    --ink-faint:   #7C8493;
+    --line:        #2C323E;
+    --line-strong: #3D4552;
+    --accent:      #DE8A93;
+    --accent-soft: #2E1B1E;
+    --local:       #63BDB6;
+    --local-soft:  #152C2A;
+    --code-bg:     #0E1116;
+    --code-ink:    #D5DBE4;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 16.5px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .page { max-width: 80ch; margin: 0 auto; padding: 52px 24px 88px; }
+
+  /* masthead */
+  .masthead { display: flex; flex-direction: column; gap: 12px; }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  h1 {
+    font-family: var(--display);
+    font-weight: 500;
+    font-size: clamp(2.2rem, 5.6vw, 3.2rem);
+    line-height: 1.05;
+    letter-spacing: -0.015em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .standfirst { max-width: var(--measure); font-size: 1.1rem; color: var(--ink-soft); margin: 0; }
+  .rule { height: 3px; background: var(--ink); margin-top: 20px; }
+
+  section { margin-top: 48px; }
+  h2 {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: 1.55rem;
+    letter-spacing: -0.01em;
+    margin: 0 0 8px;
+    text-wrap: balance;
+  }
+  h3 { font-family: var(--body); font-weight: 600; font-size: 1rem; margin: 0 0 5px; }
+  p { max-width: var(--measure); }
+  .lede { max-width: var(--measure); color: var(--ink-soft); margin: 0 0 20px; }
+  a { color: var(--accent); text-underline-offset: 2px; }
+  a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  strong { font-weight: 600; }
+
+  code:not(pre code) {
+    font-family: var(--mono);
+    font-size: 0.86em;
+    background: var(--surface-alt);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  /* command block */
+  .cmd {
+    background: var(--code-bg);
+    color: var(--code-ink);
+    font-family: var(--mono);
+    font-size: 0.84rem;
+    line-height: 1.75;
+    padding: 14px 18px;
+    border-radius: 5px;
+    overflow-x: auto;
+    margin: 0;
+    white-space: pre;
+  }
+  .cmd .c { color: #8D96A6; }
+  .cmd .f { color: #E3A0A8; }
+
+  /* steps */
+  .steps { counter-reset: s; list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 26px; }
+  .steps > li { counter-increment: s; display: grid; grid-template-columns: 2.1rem 1fr; gap: 16px; align-items: start; }
+  .steps > li::before {
+    content: counter(s);
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--surface);
+    background: var(--accent);
+    width: 2.1rem; height: 2.1rem;
+    border-radius: 3px;
+    display: grid; place-items: center;
+  }
+  .steps .sbody { display: flex; flex-direction: column; gap: 9px; min-width: 0; }
+  .steps p { margin: 0; }
+
+  /* travels / stays */
+  .split { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; }
+  .col { border: 1px solid var(--line); border-radius: 5px; background: var(--surface); overflow: hidden; }
+  .col header {
+    padding: 11px 16px;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--line);
+  }
+  .col.travels header { background: var(--local-soft); color: var(--local); }
+  .col.stays header { background: var(--accent-soft); color: var(--accent); }
+  .col ul { margin: 0; padding: 14px 16px 16px 32px; display: flex; flex-direction: column; gap: 8px; font-size: 0.95rem; }
+  .col ul li::marker { color: var(--ink-faint); }
+  .col .why { padding: 0 16px 16px; color: var(--ink-soft); font-size: 0.89rem; margin: 0; }
+
+  /* label table */
+  .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 5px; }
+  table { border-collapse: collapse; width: 100%; min-width: 520px; background: var(--surface); }
+  th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  thead th {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--ink-faint); background: var(--surface-alt); border-bottom: 1px solid var(--line-strong);
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  td.lbl { font-family: var(--mono); font-size: 0.85rem; white-space: nowrap; color: var(--accent); }
+
+  /* callout */
+  .note {
+    border-left: 3px solid var(--local);
+    background: var(--local-soft);
+    padding: 15px 18px;
+    border-radius: 0 5px 5px 0;
+    display: flex; flex-direction: column; gap: 7px;
+  }
+  .note h3 { color: var(--local); }
+  .note p { margin: 0; max-width: 62ch; }
+
+  .warn {
+    border-left: 3px solid var(--accent);
+    background: var(--accent-soft);
+    padding: 15px 18px;
+    border-radius: 0 5px 5px 0;
+    display: flex; flex-direction: column; gap: 7px;
+  }
+  .warn h3 { color: var(--accent); }
+  .warn p { margin: 0; max-width: 62ch; }
+
+  /* faq */
+  .faq { display: flex; flex-direction: column; gap: 0; border-top: 1px solid var(--line); }
+  details { border-bottom: 1px solid var(--line); }
+  summary { cursor: pointer; padding: 13px 2px; font-weight: 600; font-size: 0.98rem; list-style: none; display: flex; gap: 10px; align-items: baseline; }
+  summary::-webkit-details-marker { display: none; }
+  summary::before { content: "+"; font-family: var(--mono); color: var(--accent); font-weight: 600; }
+  details[open] summary::before { content: "\2212"; }
+  details .ans { padding: 0 2px 15px 24px; color: var(--ink-soft); font-size: 0.95rem; max-width: var(--measure); }
+  details .ans p { margin: 0 0 9px; }
+  details .ans p:last-child { margin-bottom: 0; }
+
+  footer {
+    margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--line);
+    color: var(--ink-faint); font-size: 0.87rem;
+    display: flex; flex-wrap: wrap; gap: 6px 20px;
+  }
+  footer span { font-family: var(--mono); font-size: 0.79rem; }
+
+  @media (max-width: 560px) { .page { padding: 34px 17px 68px; } }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+
+<div class="page">
+
+  <header class="masthead">
+    <div class="eyebrow">AI StartUperlar · bilim almashish</div>
+    <h1>Graphify Jamoa Protokoli</h1>
+    <p class="standfirst">
+      Har kim o'z kompyuterida o'z bazasini ko'taradi. Bilim esa fayl bo'lib
+      yuradi — baza emas. Shu bitta qoida hamma narsani soddalashtiradi.
+    </p>
+    <div class="rule"></div>
+  </header>
+
+  <section>
+    <h2>Graphify nima</h2>
+    <p>
+      Claude Code uchun doimiy xotira. Suhbat yopilsa ham qarorlar, promptlar va
+      hujjatlar qoladi — keyingi safar Claude o'nlab faylni qaytadan o'qimasdan,
+      bir so'rov bilan kerakligini topadi.
+    </p>
+    <p>
+      Qidiruv <strong>ma'no bo'yicha</strong> ishlaydi: aniq so'zni bilish shart
+      emas. Va butunlay lokal — vektorlar shu kompyuterda hisoblanadi,
+      <strong>hech qanday API chaqirilmaydi</strong>.
+    </p>
+  </section>
+
+  <section>
+    <h2>O'rnatish</h2>
+    <p class="lede">Uch qadam, taxminan besh daqiqa. Python 3.10+ bo'lishi kerak.</p>
+    <ol class="steps">
+      <li>
+        <div class="sbody">
+          <h3>Repozitoriyani oling</h3>
+          <pre class="cmd">git clone https://github.com/Ibrohim-Bxone/graphify-mcp.git
+cd graphify-mcp</pre>
+        </div>
+      </li>
+      <li>
+        <div class="sbody">
+          <h3>O'rnatuvchini ishga tushiring</h3>
+          <pre class="cmd">install.bat</pre>
+          <p>
+            U virtual muhit yaratadi, kutubxonalarni qo'yadi va Graphify'ni
+            Claude Code'ga MCP server sifatida ro'yxatga oladi. Birinchi
+            marta bir necha daqiqa oladi.
+          </p>
+        </div>
+      </li>
+      <li>
+        <div class="sbody">
+          <h3>Claude Code'ni yopib qayta oching</h3>
+          <p>
+            MCP serverlari ishga tushganda bir marta o'qiladi — qayta
+            ochmaguningizcha Graphify ko'rinmaydi.
+          </p>
+        </div>
+      </li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Asosiy tushuncha</h2>
+    <p class="lede">
+      Bu qismni tushunsangiz, qolgani o'z-o'zidan aniq bo'ladi.
+    </p>
+    <div class="split">
+      <div class="col travels">
+        <header>Ko'chadi — ulashiladi</header>
+        <ul>
+          <li><code>.md</code> fayllar — qaydlar, qo'llanmalar, promptlar</li>
+          <li>Bot arxivi — har fayl ichida to'liq yozuv JSON blok sifatida</li>
+          <li>Papka, git repo, hatto Telegramdagi fayl</li>
+        </ul>
+        <p class="why">Matn — haqiqat manbai. U yengil, o'qiladi va har kimning bazasida qayta qurilaveradi.</p>
+      </div>
+      <div class="col stays">
+        <header>Ko'chmaydi — shaxsiy</header>
+        <ul>
+          <li><code>kg_db/</code> — vektor baza</li>
+          <li><code>token_stats.json</code>, <code>models_config.json</code></li>
+          <li>Sizning sessiya xotiralaringiz</li>
+        </ul>
+        <p class="why">Baza — hosila indeks, nusxa ko'chirish uchun emas. U repoda ham <code>.gitignore</code> ichida.</p>
+      </div>
+    </div>
+    <p style="margin-top:18px">
+      Ya'ni: <strong>siz fayl ulashasiz, sherigingiz uni o'z bazasiga indekslaydi.</strong>
+      Hech kim hech kimning shaxsiy xotirasini ko'rmaydi.
+    </p>
+  </section>
+
+  <section>
+    <h2>Ulashish — bitta buyruq</h2>
+    <p class="lede">
+      Jamoadan kelgan <code>.md</code> fayllarni o'z bazangizga qo'shish:
+    </p>
+    <pre class="cmd"><span class="c"># graphify-mcp papkasi ichida turib:</span>
+.venv\Scripts\python.exe indexer.py "<span class="f">C:\jamoa-bilim</span>" --project shared --kind doc</pre>
+    <p style="margin-top:16px">
+      <code>--project shared</code> — <strong>eng muhim qism</strong>. Shu yorliq
+      bilan yozilgan hamma narsa qaysi loyihada ishlayotganingizdan qat'i nazar
+      qidiruvda chiqadi. Boshqa yorliq bersangiz, u faqat o'sha loyihada
+      ko'rinadi.
+    </p>
+    <p>
+      Buyruqni qayta ishga tushirsangiz dublikat bo'lmaydi — fayl yo'li bo'yicha
+      yangilanadi. Ya'ni papka o'zgargan sari shunchaki qaytadan yugurtirasiz.
+    </p>
+  </section>
+
+  <section>
+    <h2>Yorliqlar nima qiladi</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Yorliq</th><th>Qachon ko'rinadi</th><th>Nima uchun ishlatiladi</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="lbl">shared</td>
+            <td><strong>Hamma loyihada</strong>, doim</td>
+            <td>Jamoa bilimi, umumiy qo'llanmalar, promptlar</td>
+          </tr>
+          <tr>
+            <td class="lbl">Promtlarim</td>
+            <td><strong>Hamma loyihada</strong>, doim</td>
+            <td>Bot yig'adigan Instagram/YouTube bilimlari</td>
+          </tr>
+          <tr>
+            <td class="lbl">&lt;loyiha nomi&gt;</td>
+            <td>Faqat o'sha papkada ishlaganda</td>
+            <td>Loyihaga xos qarorlar — boshqa ishga aralashmaydi</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top:16px">
+      Loyiha yorlig'i avtomatik qo'yiladi — Claude Code qaysi papkada ochilgan
+      bo'lsa, o'sha papka nomi. Qo'lda yozish shart emas.
+    </p>
+  </section>
+
+  <section>
+    <h2>Kundalik ishlatish</h2>
+    <p class="lede">Odatda hech narsa yozishingiz shart emas — Claude o'zi chaqiradi.</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Nima qilasiz</th><th>Nima bo'ladi</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Yangi vazifa boshlaysiz</td>
+            <td>Claude avval bazadan qidiradi — oldingi qarorlar tiklanadi</td>
+          </tr>
+          <tr>
+            <td>Katta ish tugaydi</td>
+            <td>Claude xulosani o'zi saqlaydi</td>
+          </tr>
+          <tr>
+            <td>«Bazadan qidir: …» deysiz</td>
+            <td>Aniq so'rov bilan qidiradi</td>
+          </tr>
+          <tr>
+            <td>«Buni eslab qol» deysiz</td>
+            <td>Qaror yoki qayd sifatida saqlanadi</td>
+          </tr>
+          <tr>
+            <td>Eskirgan narsa topilsa</td>
+            <td>Aytasiz — o'chiradi. Noto'g'ri xotira yo'qdan yomonroq</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <div class="note">
+      <h3>Bot arxivi tayyor to'plam</h3>
+      <p>
+        Botimiz yig'gan 377 ta markdown fayl aynan shu formatda —
+        har birining oxirida to'liq yozuv JSON blok sifatida turadi. O'sha
+        papkani olib, yuqoridagi buyruq bilan indekslasangiz, jamoaning
+        bir necha oylik topilmalari sizning bazangizda paydo bo'ladi.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <div class="warn">
+      <h3>Ulashishdan oldin bir marta o'qib chiqing</h3>
+      <p>
+        Fayl ketgach qaytmaydi. Shaxsiy qaydlar, mijoz ma'lumotlari, kalitlar va
+        parollar tasodifan qaydlar orasiga tushib qolgan bo'lishi mumkin. Ulashish
+        papkasini alohida saqlang — hamma narsani emas, ataylab tanlanganini.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Tez-tez so'raladigan</h2>
+    <div class="faq">
+      <details>
+        <summary>Bazani to'g'ridan-to'g'ri nusxa qilib bersam bo'ladimi?</summary>
+        <div class="ans">
+          <p>
+            Texnik jihatdan mumkin, lekin qilmang. <code>kg_db/</code> ichida
+            sizning shaxsiy sessiya xotiralaringiz ham bor, va u ~22 MB ikkilik
+            fayl — nima ketayotganini ko'rib bo'lmaydi.
+          </p>
+          <p>
+            Markdown ulashish esa ko'rinadigan, tanlanadigan va qayta
+            quriladigan. Shu sababli protokol shunday.
+          </p>
+        </div>
+      </details>
+      <details>
+        <summary>Embedding modelini almashtirsam nima bo'ladi?</summary>
+        <div class="ans">
+          <p>
+            Bitta kolleksiyada ikki xil model aralashmaydi. Model almashtirsangiz
+            <code>kg_db/</code> ni tozalab, fayllarni qaytadan indekslash kerak —
+            markdown saqlanib turgani uchun bu arzon amal.
+          </p>
+        </div>
+      </details>
+      <details>
+        <summary>Bir xil faylni ikki marta indekslasam dublikat bo'ladimi?</summary>
+        <div class="ans">
+          <p>
+            Yo'q. Yozuvlar fayl yo'li va bo'lak raqami bo'yicha kalitlanadi,
+            shuning uchun qayta ishga tushirish yangilash bo'lib chiqadi.
+          </p>
+        </div>
+      </details>
+      <details>
+        <summary>Internet kerakmi?</summary>
+        <div class="ans">
+          <p>
+            Faqat o'rnatishda (kutubxonalar yuklab olinadi). Undan keyin qidiruv
+            ham, saqlash ham offline ishlaydi.
+          </p>
+        </div>
+      </details>
+      <details>
+        <summary>Graphify ko'rinmayapti, nima qilay?</summary>
+        <div class="ans">
+          <p>
+            Deyarli har doim sabab bitta: Claude Code qayta ochilmagan. MCP
+            serveri faqat ishga tushganda o'qiladi.
+          </p>
+          <p>
+            Kod yangilangandan keyin ham xuddi shunday — <code>git pull</code>
+            qilgach Claude Code'ni yoping va qayta oching.
+          </p>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <footer>
+    <span>2026-09-04</span>
+    <span>github.com/Ibrohim-Bxone/graphify-mcp</span>
+    <span>0 API token</span>
+  </footer>
+
+</div>

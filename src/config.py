@@ -23,6 +23,13 @@ ADMIN_USER_IDS = _ids(os.getenv("ADMIN_USER_IDS", "")) or set(ALLOWED_USER_IDS)
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 MODEL_EXTRACT = os.getenv("MODEL_EXTRACT", "gemma4:12b")
 MODEL_VISION = os.getenv("MODEL_VISION", "gemma4:12b")
+
+EXTRACT_BACKEND = os.getenv("EXTRACT_BACKEND", "vertex").lower()
+VISION_BACKEND = os.getenv("VISION_BACKEND", "vertex").lower()
+VERTEX_MODEL = os.getenv("VERTEX_MODEL", "gemini-3.7-flash")
+VERTEX_TIMEOUT = int(os.getenv("VERTEX_TIMEOUT", "120"))
+VERIFY_NAMES = os.getenv("VERIFY_NAMES", "1") not in ("0", "false", "False", "")
+TOOLS_CACHE_ERROR_TTL_SEC = int(os.getenv("TOOLS_CACHE_ERROR_TTL_SEC", "86400"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 # 8192 fits gemma4:12b fully in an 8GB card alongside its KV cache; a larger
 # context (e.g. 32768) pushes part of the model onto the CPU and makes every
@@ -31,6 +38,21 @@ OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 # 4096 output tokens is enough for full extraction JSON schemas; without an
 # explicit budget Ollama cuts generation early with done_reason="length".
 OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "4096"))
+LLM_TIMEOUT_DEFAULT = int(os.getenv("LLM_TIMEOUT_DEFAULT", "900"))
+
+# ffmpeg chaqiruvlari uchun chegara (kadr olish va audio ajratish). Bu qiymatsiz
+# buzuq fayl yagona ishchini abadiy osib qo'yadi (transcribe.py:56). 600 —
+# pipeline.py:444 izohi ("retrying buys another 600s hang") shu qiymatga ishora
+# qiladi.
+FFMPEG_TIMEOUT_SEC = int(os.getenv("FFMPEG_TIMEOUT_SEC", "600"))
+# Video uzunligi chegarasi. 0 = O'CHIRILGAN (pipeline.py:274
+# `if config.MAX_VIDEO_SEC and ...` — 0 shartni butunlay o'tkazib yuboradi).
+# 2026-09-05 da asoschi qarori: chegara qo'yilmaydi. Asl qiymati hujjatlanmagan
+# edi va bir marta ham ishga tushmagan (jobs bazasida VideoTooLongError yo'q).
+# Uzun videoni cheklash kerak bo'lsa: .env ga MAX_VIDEO_SEC=<soniya>.
+MAX_VIDEO_SEC = int(os.getenv("MAX_VIDEO_SEC", "0"))
+# Yangi yozuv jamoaning qolgan a'zolariga yuborilsinmi (worker.py:195).
+BROADCAST_ENABLED = os.getenv("BROADCAST_ENABLED", "1") not in ("0", "false", "False", "")
 
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto")
@@ -44,6 +66,15 @@ MIN_TRANSCRIPT_CHARS = int(os.getenv("MIN_TRANSCRIPT_CHARS", "200"))
 # topics score ~0.10-0.15. 0.90 never fires in practice — 0.75 leaves margin
 # below true duplicates while staying well clear of unrelated content.
 DUPLICATE_SIMILARITY_THRESHOLD = float(os.getenv("DUPLICATE_SIMILARITY_THRESHOLD", "0.75"))
+
+# An article fetch reads a stranger's URL. Cap the body so one bad link
+# cannot exhaust RAM, and refuse addresses that only exist inside this
+# machine or LAN (Ollama on 11434, cloud metadata on 169.254.169.254).
+ARTICLE_MAX_BYTES = int(os.getenv("ARTICLE_MAX_BYTES", str(10 * 1024 * 1024)))
+ALLOW_PRIVATE_URLS = os.getenv("ALLOW_PRIVATE_URLS", "0") not in ("0", "false", "False", "")
+ARTICLE_MAX_REDIRECTS = int(os.getenv("ARTICLE_MAX_REDIRECTS", "5"))
+TIMEOUT_MAX_RETRIES = int(os.getenv("TIMEOUT_MAX_RETRIES", "2"))
+TIMEOUT_BACKOFF_SEC = int(os.getenv("TIMEOUT_BACKOFF_SEC", "10"))
 
 DATA_DIR = ROOT / "data"
 MEDIA_DIR = DATA_DIR / "media"

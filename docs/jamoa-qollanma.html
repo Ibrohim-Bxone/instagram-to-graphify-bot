@@ -1,0 +1,828 @@
+<title>AI Ideyalarim Bot</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Source+Sans+3:ital,wght@0,400;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+  :root {
+    --ground:      #F6F8F6;
+    --surface:     #FFFFFF;
+    --surface-alt: #EDF1EE;
+    --ink:         #14201B;
+    --ink-soft:    #4C5C55;
+    --ink-faint:   #7B8A83;
+    --line:        #DCE4DF;
+    --line-strong: #C2CEC7;
+    --accent:      #2F6F4E;
+    --accent-soft: #E2EFE7;
+    --signal:      #A84A1B;
+    --signal-soft: #F7E9E0;
+
+    --display: "Fraunces", "Iowan Old Style", Georgia, serif;
+    --body: "Source Sans 3", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+    --measure: 66ch;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #0D1411;
+      --surface:     #151F1A;
+      --surface-alt: #1C2822;
+      --ink:         #E5EBE7;
+      --ink-soft:    #A9B8B1;
+      --ink-faint:   #7D8D86;
+      --line:        #26332D;
+      --line-strong: #35453D;
+      --accent:      #63C08D;
+      --accent-soft: #172E22;
+      --signal:      #E2915C;
+      --signal-soft: #2E1F14;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground:      #0D1411;
+    --surface:     #151F1A;
+    --surface-alt: #1C2822;
+    --ink:         #E5EBE7;
+    --ink-soft:    #A9B8B1;
+    --ink-faint:   #7D8D86;
+    --line:        #26332D;
+    --line-strong: #35453D;
+    --accent:      #63C08D;
+    --accent-soft: #172E22;
+    --signal:      #E2915C;
+    --signal-soft: #2E1F14;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 17px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .page {
+    max-width: 78ch;
+    margin: 0 auto;
+    padding: 56px 24px 96px;
+  }
+
+  /* ---- masthead ---- */
+  .masthead {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding-bottom: 28px;
+    border-bottom: 2px solid var(--ink);
+  }
+  .kicker {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  h1 {
+    font-family: var(--display);
+    font-optical-sizing: auto;
+    font-weight: 600;
+    font-size: clamp(2.3rem, 6vw, 3.4rem);
+    line-height: 1.02;
+    letter-spacing: -0.02em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .standfirst {
+    max-width: var(--measure);
+    font-size: 1.13rem;
+    color: var(--ink-soft);
+    margin: 0;
+  }
+  .handle {
+    font-family: var(--mono);
+    font-size: 0.95rem;
+    color: var(--ink);
+    background: var(--accent-soft);
+    padding: 2px 8px;
+    border-radius: 3px;
+  }
+
+  /* ---- facts strip ---- */
+  .facts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 0;
+    margin-top: 28px;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    overflow: hidden;
+    background: var(--surface);
+  }
+  .fact {
+    padding: 14px 18px;
+    border-right: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .fact:last-child { border-right: none; }
+  .fact dt {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin: 0;
+  }
+  .fact dd {
+    margin: 0;
+    font-family: var(--display);
+    font-size: 1.35rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.15;
+  }
+  .fact dd small {
+    font-family: var(--body);
+    font-size: 0.78rem;
+    font-weight: 400;
+    color: var(--ink-soft);
+    display: block;
+  }
+
+  /* ---- sections ---- */
+  section { margin-top: 52px; }
+  h2 {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: 1.62rem;
+    letter-spacing: -0.012em;
+    margin: 0 0 6px;
+    text-wrap: balance;
+  }
+  h2 + .lede { margin-top: 0; }
+  .lede {
+    max-width: var(--measure);
+    color: var(--ink-soft);
+    margin: 0 0 22px;
+  }
+  p { max-width: var(--measure); }
+  h3 {
+    font-family: var(--body);
+    font-weight: 700;
+    font-size: 1rem;
+    letter-spacing: 0.01em;
+    margin: 0 0 6px;
+  }
+  a { color: var(--accent); text-underline-offset: 2px; }
+  a:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+
+  code {
+    font-family: var(--mono);
+    font-size: 0.87em;
+    background: var(--surface-alt);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  /* ---- accepted inputs ---- */
+  .inputs {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .input-cell {
+    background: var(--surface);
+    padding: 16px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .input-cell .what { font-weight: 700; font-size: 0.98rem; }
+  .input-cell .how { color: var(--ink-soft); font-size: 0.92rem; }
+
+  /* ---- pipeline ---- */
+  .pipeline {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    border-left: 2px solid var(--line-strong);
+  }
+  .stage {
+    display: grid;
+    grid-template-columns: 2.2rem 1fr;
+    gap: 14px;
+    padding: 11px 0 11px 20px;
+    position: relative;
+  }
+  .stage::before {
+    content: "";
+    position: absolute;
+    left: -5px;
+    top: 20px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+  }
+  .stage .glyph { font-size: 1.25rem; line-height: 1.4; }
+  .stage .body { display: flex; flex-direction: column; gap: 1px; }
+  .stage .label { font-weight: 700; }
+  .stage .note { color: var(--ink-soft); font-size: 0.93rem; }
+  .stage .note em { color: var(--ink-faint); font-style: normal; font-family: var(--mono); font-size: 0.85em; }
+
+  /* ---- steps (a real sequence) ---- */
+  .steps {
+    counter-reset: step;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+  .steps > li {
+    counter-increment: step;
+    display: grid;
+    grid-template-columns: 2rem 1fr;
+    gap: 16px;
+    align-items: start;
+  }
+  .steps > li::before {
+    content: counter(step);
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--accent);
+    border: 1px solid var(--line-strong);
+    border-radius: 50%;
+    width: 2rem;
+    height: 2rem;
+    display: grid;
+    place-items: center;
+    background: var(--surface);
+  }
+  .steps p { margin: 4px 0 0; }
+
+  pre.sh {
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    line-height: 1.7;
+    background: var(--surface-alt);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 12px 14px;
+    margin: 10px 0 0;
+    overflow-x: auto;
+    white-space: pre;
+  }
+
+  /* ---- broadcast sample ---- */
+  .telegram {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 4px 4px 4px 12px;
+    padding: 18px 20px;
+    font-size: 0.95rem;
+    max-width: 52ch;
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+  }
+  .telegram .tg-head { font-weight: 700; }
+  .telegram .tg-by { color: var(--ink-soft); font-size: 0.88rem; }
+  .telegram ul { margin: 0; padding-left: 1.1rem; display: flex; flex-direction: column; gap: 5px; }
+  .telegram .tg-foot {
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    color: var(--ink-faint);
+    border-top: 1px solid var(--line);
+    padding-top: 9px;
+  }
+
+  /* ---- commands ---- */
+  .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 4px; }
+  table { border-collapse: collapse; width: 100%; min-width: 480px; background: var(--surface); }
+  th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  thead th {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    background: var(--surface-alt);
+    border-bottom: 1px solid var(--line-strong);
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  td.cmd { font-family: var(--mono); font-size: 0.87rem; white-space: nowrap; }
+  .who {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 999px;
+    border: 1px solid var(--line-strong);
+    color: var(--ink-soft);
+    white-space: nowrap;
+  }
+  .who.admin { color: var(--signal); border-color: var(--signal); }
+
+  /* ---- callout ---- */
+  .callout {
+    border-left: 3px solid var(--signal);
+    background: var(--signal-soft);
+    padding: 16px 20px;
+    border-radius: 0 4px 4px 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .callout h3 { color: var(--signal); }
+  .callout p { margin: 0; max-width: 62ch; }
+
+  /* ---- limits ---- */
+  .limits { display: flex; flex-direction: column; gap: 18px; }
+  .limit {
+    display: grid;
+    grid-template-columns: minmax(120px, 200px) 1fr;
+    gap: 20px;
+    padding-bottom: 18px;
+    border-bottom: 1px solid var(--line);
+  }
+  .limit:last-child { border-bottom: none; padding-bottom: 0; }
+  .limit .term { font-weight: 700; font-size: 0.97rem; }
+  .limit .desc { color: var(--ink-soft); font-size: 0.95rem; }
+
+  footer {
+    margin-top: 64px;
+    padding-top: 22px;
+    border-top: 1px solid var(--line);
+    color: var(--ink-faint);
+    font-size: 0.88rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+  }
+  footer span { font-family: var(--mono); font-size: 0.8rem; }
+
+  @media (max-width: 560px) {
+    .page { padding: 36px 18px 72px; }
+    .limit { grid-template-columns: 1fr; gap: 4px; }
+    .fact { border-right: none; border-bottom: 1px solid var(--line); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+
+<div class="page">
+
+  <header class="masthead">
+    <div class="kicker">AI StartUperlar · jamoa bilim bazasi</div>
+    <h1>AI Ideyalarim Bot</h1>
+    <p class="standfirst">
+      <span class="handle">@AIideyalarimbot</span> — video, post yoki maqolani tashlaysiz,
+      u o'qib, mag'zini ajratib, qidiriladigan umumiy bazaga saqlaydi va jamoadagi
+      qolganlarga xabar beradi.
+    </p>
+  </header>
+
+  <dl class="facts">
+    <div class="fact">
+      <dt>Bazada</dt>
+      <dd>1 884<small>yozuv</small></dd>
+    </div>
+    <div class="fact">
+      <dt>Arxiv</dt>
+      <dd>384<small>markdown fayl</small></dd>
+    </div>
+    <div class="fact">
+      <dt>API xarajati</dt>
+      <dd>0<small>token — hammasi lokal</small></dd>
+    </div>
+    <div class="fact">
+      <dt>Bir video</dt>
+      <dd>2–6<small>daqiqa</small></dd>
+    </div>
+  </dl>
+
+  <section>
+    <h2>Bot nima qiladi</h2>
+    <p class="lede">
+      Uch ish: <strong>o'qiydi</strong>, <strong>mag'zini ajratadi</strong>, <strong>eslab qoladi</strong>.
+    </p>
+    <p>
+      Videoni yuklab oladi, nutqni matnga aylantiradi, kerak bo'lsa kadrlardagi
+      yozuvlarni ham o'qiydi. So'ng undan qisqa xulosa, aniq elementlar (prompt,
+      vosita, skill, model) va qo'llash tavsiyalarini ajratib oladi. Natija ikki
+      joyga tushadi: o'qish uchun markdown arxiv va semantik qidiruv uchun vektor
+      baza.
+    </p>
+    <p>
+      Butun jarayon <strong>shu kompyuterda</strong> ishlaydi — nutq uchun Whisper,
+      matn uchun Ollama. Hech qanday tashqi API chaqirilmaydi, ya'ni har bir video
+      pul turmaydi.
+    </p>
+  </section>
+
+  <section>
+    <h2>Nima tashlash mumkin</h2>
+    <div class="inputs">
+      <div class="input-cell">
+        <span class="what">🔗 Video linki</span>
+        <span class="how">Instagram, YouTube, TikTok, X, Reddit, Facebook, Vimeo, LinkedIn</span>
+      </div>
+      <div class="input-cell">
+        <span class="what">🎬 Video fayl</span>
+        <span class="how">To'g'ridan-to'g'ri chatga tashlang</span>
+      </div>
+      <div class="input-cell">
+        <span class="what">🖼 Rasm va matn</span>
+        <span class="how">Kanal yoki guruhdan forward. Albom ham bo'ladi</span>
+      </div>
+      <div class="input-cell">
+        <span class="what">📝 Faqat matn</span>
+        <span class="how">Forward qilingan post. Havola bo'lsa maqolani o'zi ochadi</span>
+      </div>
+    </div>
+    <p style="margin-top:16px">
+      Ro'yxatda yo'q saytdan majburan yuklash kerak bo'lsa —
+      <code>/video &lt;link&gt;</code>.
+    </p>
+  </section>
+
+  <section>
+    <h2>Qanday ishlaydi</h2>
+    <p class="lede">
+      Tashlaganingizdan keyin xabaringiz o'zi yangilanib boradi — qaysi bosqichda
+      turganini shu yerdan ko'rasiz.
+    </p>
+    <ol class="pipeline">
+      <li class="stage">
+        <span class="glyph">⏳</span>
+        <span class="body">
+          <span class="label">Navbatda</span>
+          <span class="note">Bir vaqtda bitta ish bajariladi <em>— videokarta bitta</em></span>
+        </span>
+      </li>
+      <li class="stage">
+        <span class="glyph">📥</span>
+        <span class="body">
+          <span class="label">Yuklanmoqda</span>
+          <span class="note">Video yoki maqola olinadi</span>
+        </span>
+      </li>
+      <li class="stage">
+        <span class="glyph">🎧</span>
+        <span class="body">
+          <span class="label">Transkripsiya</span>
+          <span class="note">Nutq matnga aylantiriladi <em>whisper large-v3</em></span>
+        </span>
+      </li>
+      <li class="stage">
+        <span class="glyph">🖼</span>
+        <span class="body">
+          <span class="label">Kadrlar o'qilmoqda</span>
+          <span class="note">Faqat gapirilmagan, ekranga yozilgan narsa bo'lsa</span>
+        </span>
+      </li>
+      <li class="stage">
+        <span class="glyph">🧠</span>
+        <span class="body">
+          <span class="label">Mag'z ajratilmoqda</span>
+          <span class="note">Xulosa, elementlar, tavsiyalar <em>gemma4:12b</em></span>
+        </span>
+      </li>
+      <li class="stage">
+        <span class="glyph">💾</span>
+        <span class="body">
+          <span class="label">Saqlanmoqda</span>
+          <span class="note">Arxiv fayli va vektor baza</span>
+        </span>
+      </li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Jamoa uchun asosiy o'zgarish</h2>
+    <p class="lede">
+      Ilgari har kim faqat o'zi tashlaganini ko'rardi. Endi kimdir yangilik
+      qo'shsa, <strong>qolgan hammaga to'liq kartochka boradi</strong> — qidirib
+      o'tirish shart emas.
+    </p>
+    <div class="telegram">
+      <div class="tg-head">🆕 <strong>@ciscoucell</strong> yangi bilim qo'shdi:</div>
+      <div class="tg-by">✅ <strong>AI Agents YouTube Content Processing Skills</strong><br><em>skill</em></div>
+      <ul>
+        <li>YouTube kontentini qayta ishlash uchun yangi uslublar to'plami.</li>
+        <li>Agentlar uzun videolarni tahlil qilish va subtitrlar olish qobiliyatiga ega.</li>
+      </ul>
+      <div class="tg-foot">💾 Graphify: 4 ta yozuv · project=Promtlarim</div>
+    </div>
+    <p style="margin-top:18px">
+      Xabarda kim qo'shgani ko'rinadi. O'chirish va qayta ishlash tugmalari esa
+      faqat muallifning o'z xabarida bo'ladi — boshqaning yozuvini o'chirib
+      yuborish mumkin emas.
+    </p>
+  </section>
+
+  <section>
+    <h2>Boshlash — uch qadam</h2>
+    <ol class="steps">
+      <li>
+        <div>
+          <h3>Botni oching va <code>/start</code> bosing</h3>
+          <p>
+            Bu <strong>majburiy</strong>. Telegram boti suhbatni o'zi boshlay
+            olmaydi: siz bir marta yozmaguningizcha u sizga hech narsa
+            yubora olmaydi — jamoa yangiliklarini ham.
+          </p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <h3>Ruxsat yo'q desa, ID'ingizni adminga yuboring</h3>
+          <p>
+            Bot javobida sizning ID raqamingiz chiqadi. Uni Ibrohimga tashlang,
+            u ro'yxatga qo'shadi.
+          </p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <h3>Biror link yoki postni tashlang</h3>
+          <p>
+            Bosqichlar xabarning o'zida yangilanib boradi. Tayyor bo'lgach
+            kartochka keladi, jamoaga esa xabar ketadi.
+          </p>
+        </div>
+      </li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Buyruqlar</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Buyruq</th><th>Nima qiladi</th><th>Kim</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="cmd">/start</td>
+            <td>Yordam matni va sizning ID raqamingiz</td>
+            <td><span class="who">hamma</span></td>
+          </tr>
+          <tr>
+            <td class="cmd">/search so'rov</td>
+            <td>Bazadan ma'no bo'yicha qidirish — aniq so'zni bilish shart emas</td>
+            <td><span class="who">hamma</span></td>
+          </tr>
+          <tr>
+            <td class="cmd">/search all: so'rov</td>
+            <td>Faqat shu baza emas, hamma loyiha bo'ylab qidirish</td>
+            <td><span class="who">hamma</span></td>
+          </tr>
+          <tr>
+            <td class="cmd">/status</td>
+            <td>Navbat holati va sizning oxirgi ishlaringiz</td>
+            <td><span class="who">hamma</span></td>
+          </tr>
+          <tr>
+            <td class="cmd">/video &lt;link&gt;</td>
+            <td>Ro'yxatda yo'q saytdan majburan video yuklash</td>
+            <td><span class="who">hamma</span></td>
+          </tr>
+          <tr>
+            <td class="cmd">/cancel</td>
+            <td>Boshlangan amalni bekor qilish</td>
+            <td><span class="who">hamma</span></td>
+          </tr>
+          <tr>
+            <td class="cmd">/users</td>
+            <td>Foydalanuvchilar ro'yxati — kimga xabar yetadi, kim <code>/start</code> bosmagan</td>
+            <td><span class="who admin">admin</span></td>
+          </tr>
+          <tr>
+            <td class="cmd">/install &lt;kod&gt;</td>
+            <td>Yozuvda tilga olingan vositani shu mashinaga o'rnatish</td>
+            <td><span class="who admin">admin</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Bilib qo'yish kerak</h2>
+    <div class="limits">
+      <div class="limit">
+        <div class="term">Bir vaqtda bitta ish</div>
+        <div class="desc">
+          Videokarta bitta, shuning uchun ishlar navbat bilan bajariladi. Bir necha
+          kishi barobar tashlasa, kutish uzayadi — bu normal, xato emas.
+        </div>
+      </div>
+      <div class="limit">
+        <div class="term">Takror tashlash zarar qilmaydi</div>
+        <div class="desc">
+          Bir link yoki matnni ikki kishi tashlasa, ikki marta qayta ishlanmaydi —
+          bot mavjud yozuvni ko'rsatadi. O'xshash (lekin aynan bir xil bo'lmagan)
+          mazmun uchun 🔁 eslatmasi chiqadi.
+        </div>
+      </div>
+      <div class="limit">
+        <div class="term">🗑 qaytarib bo'lmaydi</div>
+        <div class="desc">
+          O'chirish tugmasi bazadagi yozuvni ham, arxiv faylini ham o'chiradi.
+          Tiklab bo'lmaydi. Shuning uchun u faqat yozuv muallifiga va adminga ochiq.
+        </div>
+      </div>
+      <div class="limit">
+        <div class="term">Hamma narsa saqlanmaydi</div>
+        <div class="desc">
+          Videoda o'rganishga arziydigan narsa topilmasa, bot buni ochiq aytadi va
+          bazaga yozmaydi. Transkript baribir arxivda qoladi.
+        </div>
+      </div>
+      <div class="limit">
+        <div class="term">Til bo'linishi ataylab</div>
+        <div class="desc">
+          Sarlavha va teglar inglizcha (qidiruv shu bo'yicha ishlaydi), xulosa va
+          tavsiyalar o'zbekcha, promptlar esa asl holida — tarjima qilingan prompt
+          qiymatsiz.
+        </div>
+      </div>
+      <div class="limit">
+        <div class="term">Kompyuter o'chsa</div>
+        <div class="desc">
+          Bot shu mashinada ishlaydi. U o'chirilgan bo'lsa xabarlaringiz navbatda
+          turadi va yoqilganda bajariladi — yo'qolmaydi.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Umumiy bilim bazasi — kompyuteringizga</h2>
+    <p class="lede">
+      Bot yig'gan arxiv va undan umumlashtirilgan bilim yopiq GitHub
+      repozitoriyasiga chiqariladi.
+      Uni bir marta o'rnatib qo'ysangiz, keyin bitta faylni bosish bilan
+      yangilaysiz va <strong>butun arxiv o'z kompyuteringizda qidiriladigan
+      bo'ladi</strong> — botga yozmasdan ham.
+    </p>
+    <p>
+      Repozitoriya: <code>github.com/Ibrohim-Bxone/promtlarim-jamoa</code> —
+      <strong>yopiq (private)</strong>. Ochilmasa, GitHub nomingizni Ibrohimga
+      yuboring, u sizni ro'yxatga qo'shadi.
+    </p>
+
+    <h3 style="margin-top:32px">Bir martalik o'rnatish</h3>
+    <ol class="steps">
+      <li>
+        <div>
+          <h3>Graphify'ni klon qiling va muhitini tayyorlang</h3>
+          <p>Bitta bo'sh papka oching (masalan <code>C:\bilim</code>) va u yerda:</p>
+<pre class="sh">git clone https://github.com/Ibrohim-Bxone/graphify-mcp
+cd graphify-mcp
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+cd ..</pre>
+        </div>
+      </li>
+      <li>
+        <div>
+          <h3>Bilim repozitoriyasini yoniga klon qiling</h3>
+          <p>Ayni shu papkada — ikkalasi yonma-yon turishi kerak:</p>
+<pre class="sh">git clone https://github.com/Ibrohim-Bxone/promtlarim-jamoa</pre>
+        </div>
+      </li>
+      <li>
+        <div>
+          <h3><code>yangila.bat</code> ni ikki marta bosing — bir marta</h3>
+          <p>
+            U arxivni tortib oladi, Graphify bazasiga indekslaydi va
+            <strong>o'zini Windows'ga ro'yxatdan o'tkazadi</strong>. Oxirida
+            "Endi har 6 soatda o'zi yangilanadi" degan yozuv chiqadi — o'shani
+            ko'rsangiz oynani yopavering.
+          </p>
+        </div>
+      </li>
+    </ol>
+
+    <h3 style="margin-top:32px">Keyingi safar — hech narsa</h3>
+    <p>
+      <strong>Boshqa hech qachon bosish shart emas.</strong> Skript fonda ishlab
+      turadi va har 6 soatda o'zi yangilaydi. Kompyuteringiz o'chib yonsa ham
+      o'zi qaytadan ishga tushadi.
+    </p>
+    <p style="margin-top:12px">
+      To'xtatmoqchi bo'lsangiz — buyruqlar satrida
+      <code>yangila.bat --ochir</code>. U avtomatik ishga tushishni bekor qiladi
+      va fondagi jarayonni to'xtatadi. Qayta yoqish uchun yana
+      <code>yangila.bat</code> ni bosasiz.
+    </p>
+
+    <div class="table-wrap" style="margin-top:24px">
+      <table>
+        <thead>
+          <tr><th>Papka</th><th>Nima</th><th>Graphify'da qayerga tushadi</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="cmd">instagram/</td>
+            <td>Bot yig'gan xom arxiv (384 fayl) — har post alohida, transkript va manba havolasi bilan</td>
+            <td><code>project=Promtlarim</code> · <code>kind=doc</code></td>
+          </tr>
+          <tr>
+            <td class="cmd">knowledge/</td>
+            <td>O'sha arxivdan umumlashtirilgan bilim (56 fayl, 7 toifa) — takrorsiz, guruhlangan</td>
+            <td><code>project=shared</code> · <code>kind=doc</code></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p style="margin-top:20px">
+      <strong>Ikki papka nega kerak.</strong> <code>instagram/</code> —
+      «kim, qachon, nima dedi»: asl transkript va havola. <code>knowledge/</code>
+      — «xulosa nima»: bir vosita xom arxivda o'nta postda uchraydi, bu yerda
+      esa bir marta, to'liq tavsifi bilan turadi. «Video montaj uchun qanday
+      variantlar bor?» degan savolga <code>knowledge/</code> javob beradi,
+      «o'sha reelda aynan nima deyilgan edi?» degani — <code>instagram/</code>.
+    </p>
+
+    <div class="limits" style="margin-top:24px">
+      <div class="limit">
+        <div class="term">Kuchli kompyuter kerak emas</div>
+        <div class="desc">
+          Graphify uchun faqat <code>mcp</code>, <code>chromadb</code>,
+          <code>flask</code>, <code>numpy</code> o'rnatiladi. Ollama ham, videokarta
+          ham talab qilinmaydi — qidiruv protsessorda ishlaydi. Video qayta ishlash
+          esa baribir Ibrohimning mashinasida qoladi, sizda emas.
+        </div>
+      </div>
+      <div class="limit">
+        <div class="term">Repo yopiq — ochiq tarqatilmaydi</div>
+        <div class="desc">
+          Arxiv fayllarida har yozuvning muallifi (Telegram ID raqami) yozilgan.
+          Shuning uchun repozitoriya yopiq va faqat taklif qilingan a'zolarga
+          ochiladi. Ichidagi fayllarni tashqariga chiqarmang.
+        </div>
+      </div>
+      <div class="limit">
+        <div class="term">Yangilanish darrov ko'rinmasa</div>
+        <div class="desc">
+          Odatda Claude Code'ni qayta ishga tushirish shart emas — Graphify baza
+          o'zgarganini o'zi sezadi. Agar shunday bo'lsa ham yangi bilim
+          topilmasa, Claude Code'ni bir marta qayta ishga tushiring.
+        </div>
+      </div>
+      <div class="limit">
+        <div class="term">Repoga o'zingiz yozmaysiz</div>
+        <div class="desc">
+          Sinxronlash bir tomonlama: Ibrohimdan sizga. Yangi bilim qo'shish yo'li
+          o'sha-o'sha — botga tashlaysiz, u keyingi aylanishda repoga chiqadi.
+          Repoga faqat bot arxivi chiqadi, boshqa fayllar emas.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="callout">
+      <h3>Hozircha 13 kishidan 11 tasiga xabar bormayapti</h3>
+      <p>
+        Ular ro'yxatda bor, lekin botga hech qachon yozmagan. Telegram qoidasi:
+        bot birinchi bo'lib yoza olmaydi. Bitta <code>/start</code> shuni hal
+        qiladi — jamoa chatiga eslatib qo'ying.
+      </p>
+    </div>
+  </section>
+
+  <footer>
+    <span>2026-09-04</span>
+    <span>whisper large-v3 + gemma4:12b</span>
+    <span>0 API token</span>
+  </footer>
+
+</div>

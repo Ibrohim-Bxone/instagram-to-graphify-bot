@@ -11,7 +11,7 @@ from src import pipeline, queue_db  # noqa: E402
 def test_text_post_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline.config, "ARCHIVE_DIR", tmp_path)
     monkeypatch.setattr(pipeline.archive.config, "ARCHIVE_DIR", tmp_path)
-    monkeypatch.setattr(pipeline.kb, "upsert_record", lambda rec: len(rec.get("items", [])) + 1)
+    monkeypatch.setattr(pipeline.kb, "upsert_record", lambda rec, *a, **k: len(rec.get("items", [])) + 1)
 
     text = ("Claude Code endi subagentlarni parallel ishga tushira oladi. "
             "Batafsil: https://claude.com/blog/subagents")

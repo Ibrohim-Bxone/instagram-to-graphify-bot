@@ -216,11 +216,15 @@ Start with `/start`. Then:
 
 | You send | Result |
 |---|---|
-| Instagram/YouTube link | Queued, you get a message when it's done |
-| Video file | Same |
+| Video link (Instagram, YouTube, TikTok, X, Reddit, Facebook, Vimeo, LinkedIn, …) | Queued, you get a message when it's done |
+| A bare link to any article (habr, a blog, docs) | The page text is fetched and extracted — no video involved |
+| Video file (≤20MB, or 2GB with a self-hosted Bot API server) | Same |
 | Photo(s) (single or album) + caption | Same |
 | Forwarded text (with a link) | Same |
+| `/video <link>` | Forces the video pipeline for a host not in the recognised list |
 | `/status` | Queue status and recent jobs |
+| `/users` | **Admin only.** Panel with a ➕ button to grant access by Telegram id, and ❌ buttons to revoke |
+| `/install <shortcode>` | **Admin only, off by default.** Offers to install what an entry mentions — see below |
 | `/search <query>` | Searches your saved knowledge (e.g. `/search prompt chaining`) |
 | `/search all: <query>` | Searches **across all projects** in the knowledge base (useful in Graphify mode) |
 | 🗑 button | **Permanently deletes** the entry from the database AND the archive file — cannot be undone |
@@ -228,6 +232,37 @@ Start with `/start`. Then:
 
 You can send many items at once — the bot processes them one at a time (GPU
 memory is limited, no parallelism), and messages you as each one finishes.
+
+#### Access tiers
+
+| Tier | Where it lives | Can ingest | Can add users | Can install |
+|---|---|---|---|---|
+| Admin | `ADMIN_USER_IDS` in `.env` | yes | yes | yes |
+| `.env` user | `ALLOWED_USER_IDS` | yes | no | no |
+| Added user | ➕ button, stored in `data/members.json` | yes | no | no |
+
+Admins are configured in `.env` only. A Telegram message can never promote its
+own sender, so the ➕ button grants ingest access and nothing more. A user finds
+their own id by sending `/start`.
+
+#### `/install` — reading a link, then installing what it mentions
+
+Off unless `INSTALL_ENABLED=true`, and admin-only even then. The text it works
+from came off the internet, so a reel or article can name any package it likes.
+The design assumes that:
+
+- Four installers exist and no others: `git clone`, `npm install -g`,
+  `pip install`, `ollama pull`. There is no code path for anything else.
+- No command string is ever taken from the extracted text — only a **name**,
+  which must match a pattern that excludes whitespace, shell metacharacters and
+  leading dashes. It is then placed into a fixed argv this repo owns.
+- `subprocess` runs with `shell=False`. No pipes, no `curl | bash`.
+- Two taps: the first shows the exact command and target folder, the second runs
+  it. The offer is held in memory, so a restart voids every pending button.
+- Clones land in `TOOLS_DIR`/`SKILLS_DIR`, both inside `data/` by default.
+
+It is still a channel that runs commands on your machine from a chat message.
+Leave it off unless you want that.
 
 ### How it works (pipeline)
 

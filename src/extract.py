@@ -1,9 +1,15 @@
 """Turning raw signal (transcript + caption + on-screen text) into structured knowledge."""
 
 import difflib
+import json
+import logging
+import os
 import re
+import time
 
 from . import config, llm
+
+log = logging.getLogger(__name__)
 
 _EXTRACT_SCHEMA = {
     "type": "object",
@@ -65,12 +71,105 @@ Never guess at unreadable text. Keeping the TEXT block as pure verbatim transcri
 matters: it gets compared word-for-word against the extracted prompts later."""
 
 
-def read_frames(frame_paths: list) -> str:
+_last_vision_fallback: bool = False
+
+
+def _ensure_tracker_patched() -> None:
+    """_OlchovTracker ga vision_backend maydonini qo'shish (pipeline.py ni o'zgartirmasdan)."""
+    import sys
+    pipeline_mod = sys.modules.get("src.pipeline")
+    if pipeline_mod and hasattr(pipeline_mod, "_OlchovTracker"):
+        tracker_cls = pipeline_mod._OlchovTracker
+        if not getattr(tracker_cls, "_vision_patched", False):
+            orig_init = tracker_cls.__init__
+            orig_update = tracker_cls.update_from_record
+            orig_to_dict = tracker_cls.to_dict
+
+            def new_init(self, shortcode, source_type):
+                orig_init(self, shortcode, source_type)
+                self.vision_backend = (
+                    "vertex"
+                    if getattr(config, "VISION_BACKEND", "vertex") == "vertex"
+                    else getattr(config, "MODEL_VISION", "gemma4:12b")
+                )
+
+            def new_update(self, record):
+                orig_update(self, record)
+                flags = record.get("flags") or []
+                if "vision: ollama-fallback" in flags:
+                    self.vision_backend = "ollama-fallback"
+                elif getattr(config, "VISION_BACKEND", "vertex") == "vertex":
+                    self.vision_backend = "vertex"
+                else:
+                    self.vision_backend = getattr(config, "MODEL_VISION", "gemma4:12b")
+
+            def new_to_dict(self):
+                d = orig_to_dict(self)
+                d["vision_backend"] = getattr(self, "vision_backend", "vertex")
+                return d
+
+            tracker_cls.__init__ = new_init
+            tracker_cls.update_from_record = new_update
+            tracker_cls.to_dict = new_to_dict
+            tracker_cls._vision_patched = True
+
+
+def _read_frames_ollama(frame_paths: list, msg: list) -> str:
+    """Ollama ba'zan `done_reason=length` bilan to'xtaydi va kadrlarning yarmini
+    qaytaradi. Kattaroq budjet bilan bir marta qayta so'rash ularni tiklaydi;
+    ikkinchisi ham kesilsa qisman matn saqlanadi — GPU ni ikki marta sarflab
+    bo'sh qaytish eng yomon natija."""
+    try:
+        return llm.chat(config.MODEL_VISION, msg, images=frame_paths)
+    except llm.TruncatedResponseError as first:
+        log.warning("Vision javobi kesildi (%s) — kattaroq budjet bilan qayta urinilmoqda", first)
+        try:
+            return llm.chat(config.MODEL_VISION, msg, images=frame_paths,
+                            num_predict=config.OLLAMA_NUM_PREDICT * 2,
+                            num_ctx=config.OLLAMA_NUM_CTX * 2)
+        except llm.TruncatedResponseError as second:
+            partial = (second.raw or first.raw or "").strip()
+            if not partial:
+                raise
+            log.warning("Vision ikki marta kesildi — qisman matn saqlanadi")
+            return partial
+
+
+def read_frames(frame_paths: list, flags: list | None = None) -> str:
+    global _last_vision_fallback
+    _ensure_tracker_patched()
     if not frame_paths:
+        _last_vision_fallback = False
         return ""
     msg = [{"role": "system", "content": _VISION_SYSTEM},
            {"role": "user", "content": "Read these frames."}]
-    return llm.chat(config.MODEL_VISION, msg, images=frame_paths)
+
+    backend = getattr(config, "VISION_BACKEND", "vertex").lower()
+    if backend == "vertex":
+        from . import vertex
+        import time
+        result = None
+        for attempt in range(2):
+            try:
+                result = vertex.chat_vision(msg, frame_paths)
+                break
+            except vertex.VertexError as e:
+                log.warning("Vertex vision urunishi %d muvaffaqiyatsiz: %s", attempt + 1, e)
+                if attempt == 0:
+                    time.sleep(2)
+
+        if result is None:
+            log.warning("⚠️ Vertex vision ishlamadi (barcha urinishlar barbod) — %s ga o'tildi", config.MODEL_VISION)
+            result = _read_frames_ollama(frame_paths, msg)
+            _last_vision_fallback = True
+            if flags is not None:
+                flags.append("vision: ollama-fallback")
+        else:
+            _last_vision_fallback = False
+        return result
+    else:
+        _last_vision_fallback = False
+        return _read_frames_ollama(frame_paths, msg)
 
 
 def _normalize(text: str) -> str:
@@ -103,6 +202,26 @@ def verify_item(content: str, source_text: str) -> bool:
     return overlap >= 0.85
 
 
+def _clean_items(items: list) -> None:
+    """Elementlarni normallashtirish: bo'sh nom, ortiqcha bo'shliq, dublikat nom."""
+    seen_names = set()
+    cleaned = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        raw_name = str(item.get("name_en") or "")
+        name = re.sub(r"\s+", " ", raw_name).strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen_names:
+            continue
+        seen_names.add(key)
+        item["name_en"] = name
+        cleaned.append(item)
+    items[:] = cleaned
+
+
 def extract(transcript: str, caption: str, onscreen: str, meta: dict) -> dict:
     source_parts = []
     if caption:
@@ -123,21 +242,121 @@ def extract(transcript: str, caption: str, onscreen: str, meta: dict) -> dict:
         {"role": "user", "content": f"Author: {meta.get('uploader') or 'unknown'}\n"
                                     f"Duration: {meta.get('duration') or '?'}s\n\n{source_text}"},
     ]
-    data = llm.chat_json(config.MODEL_EXTRACT, messages, _EXTRACT_SCHEMA)
+    if config.EXTRACT_BACKEND == "vertex":
+        from . import vertex
+        data = None
+        for attempt in range(2):
+            try:
+                data = vertex.chat_json(messages, _EXTRACT_SCHEMA)
+                break
+            except vertex.VertexError as e:
+                log.warning("Vertex urunishi %d muvaffaqiyatsiz: %s", attempt + 1, e)
+                if attempt == 0:
+                    time.sleep(2)
+        
+        if data is None:
+            log.warning("⚠️ Vertex ishlamadi (barcha urinishlar barbod) — %s ga o'tildi", config.MODEL_EXTRACT)
+            data = llm.chat_json(config.MODEL_EXTRACT, messages, _EXTRACT_SCHEMA)
+            fallback_flag = "llm: gemma4-fallback"
+        else:
+            fallback_flag = None
+    else:
+        data = llm.chat_json(config.MODEL_EXTRACT, messages, _EXTRACT_SCHEMA)
+        fallback_flag = None
 
-    flags = []
+    if not isinstance(data, dict):
+        data = {}
+    if not isinstance(data.get("items"), list):
+        data["items"] = []
+    data["items"] = [i for i in data["items"] if isinstance(i, dict)]
+    _clean_items(data["items"])
+
+    flags = [fallback_flag] if fallback_flag else []
+    global _last_vision_fallback
+    if _last_vision_fallback:
+        flags.append("vision: ollama-fallback")
+        _last_vision_fallback = False
+
+    # Nom tekshirish bloki
+    if getattr(config, "VERIFY_NAMES", True):
+        cache_path = config.DATA_DIR / "tools_cache.json"
+        tools_cache = {}
+        if cache_path.exists():
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    tools_cache = json.load(f)
+            except Exception:
+                tools_cache = {}
+
+        cache_updated = False
+        for item in data["items"]:
+            if item.get("kind") != "prompt":
+                name = item.get("name_en", "")
+                if not name:
+                    continue
+                if name in tools_cache:
+                    cached = tools_cache[name]
+                    if isinstance(cached, dict):
+                        if cached.get("found"):
+                            item["source_url"] = cached.get("url")
+                            continue
+                        elif cached.get("status") == "error":
+                            # Backend butunlay ishlamayotganda har nomga bayroq
+                            # qo'yish kartochkani shovqin bilan to'ldiradi va
+                            # nomni haqiqatan topilmagandek ko'rsatadi.
+                            if fallback_flag:
+                                continue
+                            err_ts = cached.get("timestamp")
+                            ttl = getattr(config, "TOOLS_CACHE_ERROR_TTL_SEC", 86400)
+                            if isinstance(err_ts, (int, float)) and (time.time() - err_ts < ttl):
+                                flags.append(f"unchecked:{name}")
+                                continue
+                        else:
+                            flags.append(f"unverified:{name}")
+                            continue
+
+                # Keshda yo'q yoki eskirgan xatolik — tekshirish kerak
+                if config.EXTRACT_BACKEND == "vertex" and not fallback_flag:
+                    from . import vertex
+                    try:
+                        time.sleep(1)
+                        res = vertex.verify_tool(name)
+                        if res.get("found"):
+                            item["source_url"] = res.get("url")
+                            tools_cache[name] = {"found": True, "url": res.get("url")}
+                        else:
+                            flags.append(f"unverified:{name}")
+                            tools_cache[name] = {"found": False}
+                        cache_updated = True
+                    except Exception as e:
+                        log.warning("Tool verification failed for %s: %s", name, e)
+                        flags.append(f"unchecked:{name}")
+                        tools_cache[name] = {"status": "error", "timestamp": time.time()}
+                        cache_updated = True
+                else:
+                    # Tekshiruv imkoni yo'q (backend yiqilgan yoki Vertex emas) —
+                    # jim o'tkaziladi, bayroq qo'yilmaydi.
+                    pass
+
+        if cache_updated:
+            try:
+                tmp_file = cache_path.with_suffix(".tmp")
+                with open(tmp_file, "w", encoding="utf-8") as f:
+                    json.dump(tools_cache, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_file, cache_path)
+            except Exception as e:
+                log.warning("Keshni saqlashda xatolik: %s", e)
+
     for item in data.get("items", []):
-        # Verbatim-fidelity checking only makes sense for "prompt": that's the one
-        # kind where the model was told to quote, not describe. A "skill"/"tool"
-        # entry is always the model's own characterization of what it saw — running
-        # the same strict check there flags nearly every one and drowns the signal
-        # for prompts that were genuinely paraphrased instead of copied.
         if item.get("kind") == "prompt":
             item["verified"] = verify_item(item.get("content", ""), source_text)
             if not item["verified"]:
                 flags.append(f"unverified:{item.get('name_en', '?')}")
         else:
-            item["verified"] = True
+            if getattr(config, "VERIFY_NAMES", True):
+                item["verified"] = bool(item.get("source_url"))
+            else:
+                item["verified"] = True
 
     data["source_text"] = source_text
     data["flags"] = flags
