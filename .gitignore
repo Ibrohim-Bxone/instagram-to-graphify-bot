@@ -9,3 +9,13 @@ tests/fixtures/*.mp4
 .claude/settings.local.json
 *.lnk
 .env.bak-*
+
+# --- 2026-09-06 tozalash ---
+# agy/AI agentlari qoldirgan vaqtinchalik patch skriptlari
+patch_*.py
+scratch*.py
+*.bak-S-*
+.agy/
+
+# Node (github-tayyor.py talabi)
+node_modules/

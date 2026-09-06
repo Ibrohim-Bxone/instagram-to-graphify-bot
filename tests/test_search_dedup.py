@@ -33,8 +33,8 @@ def test_kb_search_filters(mock_chroma):
     
     # 1. Test project filter (default project)
     res = kb.search("cat", project=config.PROJECT_LABEL)
-    assert any(r["shortcode"] == "1" for r in res)
-    assert not any(r["shortcode"] == "3" for r in res)  # other project
+    assert any(r.get("shortcode") == "1" for r in res)
+    assert not any(r.get("shortcode") == "3" for r in res)  # other project
 
     # 2. Test kind filter
     res = kb.search("cat", kind="prompt")
@@ -43,9 +43,9 @@ def test_kb_search_filters(mock_chroma):
 
     # 3. Test exclude_shortcode
     res = kb.search("video", exclude_shortcode="1", project="all")
-    assert not any(r["shortcode"] == "1" for r in res)
+    assert not any(r.get("shortcode") == "1" for r in res)
     assert any(r["shortcode"] == "2" for r in res)
-    assert any(r["shortcode"] == "3" for r in res)
+    assert any(r.get("shortcode") == "3" for r in res)
 
 
 def test_pipeline_deduplication(mock_chroma, monkeypatch):

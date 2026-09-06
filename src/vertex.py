@@ -1,6 +1,8 @@
 import base64
 import json
 import logging
+import os
+import shutil
 from pathlib import Path
 import subprocess
 import urllib.error
@@ -10,10 +12,14 @@ from . import config
 
 log = logging.getLogger(__name__)
 
-PROJ = "project-92b77c1d-c511-47ce-965"
-LOC = "global"
+# Sozlamalar muhit o'zgaruvchilaridan olinadi. Qattiq yozilgan mashina yo'li
+# (C:\Users\<nom>\...) boshqa kompyuterda ishlamaydi va ochiq repoda foydalanuvchi
+# nomini oshkor qiladi — shuning uchun .env orqali beriladi.
+PROJ = os.getenv("VERTEX_PROJECT", "")
+LOC = os.getenv("VERTEX_LOCATION", "global")
 API = "v1beta1"
-GCLOUD = r"C:\Users\user\AppData\Local\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd"
+# gcloud PATH da bo'lsa oddiy nom yetarli; bo'lmasa .env da to'liq yo'l ko'rsatiladi.
+GCLOUD = os.getenv("GCLOUD_PATH") or shutil.which("gcloud") or "gcloud"
 
 
 class VertexError(RuntimeError):

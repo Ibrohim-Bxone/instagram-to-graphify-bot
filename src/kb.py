@@ -77,6 +77,14 @@ def _collection():
     return _col
 
 
+def _get_chunking_module():
+    import sys
+    from . import config
+    if str(config.GRAPHIFY_DIR) not in sys.path:
+        sys.path.insert(0, str(config.GRAPHIFY_DIR))
+    import chunking
+    return chunking
+
 def _est_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
@@ -199,15 +207,83 @@ def build_documents(record: dict, first_author: str = "", contributors: str = ""
              "verified": bool(item.get("verified")), "est_tokens": _est_tokens(doc)},
         ))
 
+    if record.get("transcript"):
+        doc = record["transcript"].strip()
+        if doc:
+            rows.append((
+                f"ig:{sc}:transcript:0",
+                doc,
+                {"title": f"{record.get('title_en') or sc} (Transcript)", "kind": "transcript",
+                 "tags": tags, "source": url, "project": config.PROJECT_LABEL, "date": today,
+                 "shortcode": sc, "origin": "instagram",
+                 "author": author_names or first_author,
+                 "first_author": first_author, "contributors": contributors, "author_names": author_names,
+                 "est_tokens": _est_tokens(doc)},
+            ))
+
+    if record.get("onscreen"):
+        doc = record["onscreen"].strip()
+        if doc:
+            rows.append((
+                f"ig:{sc}:ocr:0",
+                doc,
+                {"title": f"{record.get('title_en') or sc} (OCR)", "kind": "ocr",
+                 "tags": tags, "source": url, "project": config.PROJECT_LABEL, "date": today,
+                 "shortcode": sc, "origin": "instagram",
+                 "author": author_names or first_author,
+                 "first_author": first_author, "contributors": contributors, "author_names": author_names,
+                 "est_tokens": _est_tokens(doc)},
+            ))
+
+    if record.get("caption"):
+        doc = record["caption"].strip()
+        if doc:
+            rows.append((
+                f"ig:{sc}:caption:0",
+                doc,
+                {"title": f"{record.get('title_en') or sc} (Caption)", "kind": "caption",
+                 "tags": tags, "source": url, "project": config.PROJECT_LABEL, "date": today,
+                 "shortcode": sc, "origin": "instagram",
+                 "author": author_names or first_author,
+                 "first_author": first_author, "contributors": contributors, "author_names": author_names,
+                 "est_tokens": _est_tokens(doc)},
+            ))
+
+    final_rows = []
+    chunking = _get_chunking_module()
     for _id, _doc, meta in rows:
-        meta["id"] = _id
-    return rows
+        chunks = chunking.chunk_by_tokens(_doc, parent_id=_id)
+        if len(chunks) == 1:
+            meta["id"] = _id
+            meta["parent_id"] = _id
+            meta["canonical_id"] = _id
+            meta["chunk_index"] = 0
+            meta["chunk_total"] = 1
+            meta["token_count"] = chunks[0]["token_count"]
+            final_rows.append((_id, chunks[0]["text"], meta))
+        else:
+            for c in chunks:
+                cmeta = dict(meta)
+                cid = f"{_id}:part:{c['chunk_index']}"
+                cmeta["id"] = cid
+                cmeta["parent_id"] = _id
+                cmeta["canonical_id"] = cid
+                cmeta["chunk_index"] = c["chunk_index"]
+                cmeta["chunk_total"] = c["chunk_total"]
+                cmeta["token_count"] = c["token_count"]
+                final_rows.append((cid, c["text"], cmeta))
+
+    return final_rows
 
 
 def upsert_record(record: dict, author_id: str = "", author_name: str = "") -> int:
+    sc = record["shortcode"]
+    if not record.get("usable"):
+        delete_shortcode(sc)
+        return 0
+        
     author_id = str(author_id or record.get("author_id", "") or "").strip()
     author_name = str(author_name or record.get("author_name", "") or "").strip()
-    sc = record["shortcode"]
     col = _collection()
 
     existing_first = ""
@@ -276,15 +352,51 @@ def upsert_record(record: dict, author_id: str = "", author_name: str = "") -> i
     record["author_names"] = author_names
 
     rows = build_documents(record, first_author=first_author, contributors=contributors, author_names=author_names)
+    # Find existing IDs
+    existing_res = _retry(col.get, where={"shortcode": sc}, include=[])
+    existing_ids = set(existing_res.get("ids", [])) if existing_res else set()
+
     _retry(col.upsert,
            ids=[r[0] for r in rows],
            documents=[r[1] for r in rows],
            metadatas=[r[2] for r in rows])
+           
+    if _using_graphify():
+        import sys
+        if str(config.GRAPHIFY_DIR) not in sys.path:
+            sys.path.insert(0, str(config.GRAPHIFY_DIR))
+        import keyword_index
+        kw_idx = keyword_index.get_index()
+        kw_idx.upsert(
+            [r[0] for r in rows],
+            [r[1] for r in rows],
+            [r[2] for r in rows]
+        )
+        
+    # Delete orphaned IDs
+    new_ids = set(r[0] for r in rows)
+    orphaned_ids = list(existing_ids - new_ids)
+    if orphaned_ids:
+        _retry(col.delete, ids=orphaned_ids)
+        if _using_graphify():
+            kw_idx.delete(orphaned_ids)
+
     return len(rows)
 
 
 def delete_shortcode(shortcode: str) -> None:
+    existing_res = _retry(_collection().get, where={"shortcode": shortcode}, include=[])
+    existing_ids = existing_res.get("ids", []) if existing_res else []
+    
     _retry(_collection().delete, where={"shortcode": shortcode})
+    
+    if _using_graphify() and existing_ids:
+        import sys
+        if str(config.GRAPHIFY_DIR) not in sys.path:
+            sys.path.insert(0, str(config.GRAPHIFY_DIR))
+        import keyword_index
+        kw_idx = keyword_index.get_index()
+        kw_idx.delete(existing_ids)
 
 
 def count_for(shortcode: str) -> int:
@@ -314,6 +426,39 @@ def search(query: str, top_k: int = 5, project: str | None = None,
         where = where_conds[0]
     elif len(where_conds) > 1:
         where = {"$and": where_conds}
+        
+    if _using_graphify():
+        import sys
+        if str(config.GRAPHIFY_DIR) not in sys.path:
+            sys.path.insert(0, str(config.GRAPHIFY_DIR))
+        import search_core, keyword_index
+        kw_idx = keyword_index.get_index()
+        hybrid_res = search_core.hybrid_search(
+            query=query,
+            collection=col,
+            kw_index=kw_idx,
+            top_k=top_k,
+            where=where if where else None
+        )
+        # hybrid_search might return dict with 'results' key or list
+        if isinstance(hybrid_res, dict) and "results" in hybrid_res:
+            hybrid_res = hybrid_res["results"]
+        elif not isinstance(hybrid_res, list):
+            hybrid_res = []
+            
+        formatted_results = []
+        for r in hybrid_res:
+            item = dict(r.get("meta", {}))
+            item["id"] = r.get("id")
+            item["similarity"] = r.get("similarity", 0.0)
+            item["raw_similarity"] = r.get("raw_similarity", item["similarity"])
+            item["snippet"] = r.get("text", "")[:200]
+            if "shortcode" not in item and item.get("id", "").startswith("ig:"):
+                parts = item["id"].split(":")
+                if len(parts) >= 2:
+                    item["shortcode"] = parts[1]
+            formatted_results.append(item)
+        return formatted_results
         
     res = _retry(col.query, query_texts=[query], n_results=top_k, where=where if where else None)
     

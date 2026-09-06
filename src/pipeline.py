@@ -210,7 +210,7 @@ def _finish(job: dict, record: dict, media: dict, cleanup, dry_run: bool = False
                     matches = []
                 if matches and matches[0]["similarity"] >= config.DUPLICATE_SIMILARITY_THRESHOLD:
                     m = matches[0]
-                    record["flags"].append(f"possible_duplicate:{m['shortcode']}")
+                    record["flags"].append(f"possible_duplicate:{m.get('shortcode', m.get('parent_id', m['id']))}")
                     record["duplicate_of"] = m
 
             if record.get("usable"):

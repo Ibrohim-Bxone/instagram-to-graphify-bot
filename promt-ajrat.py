@@ -188,13 +188,13 @@ def main():
     parser.add_argument(
         "--arxiv",
         type=str,
-        default=r"D:\claude projects\Promtlarim\instagram",
+        default=r"D:\claude projects\graphify-ekotizim\Promtlarim\instagram",
         help="Instagram arxiv papkasi yo'li",
     )
     parser.add_argument(
         "--chiqish",
         type=str,
-        default=r"D:\claude projects\Promtlarim\prompts",
+        default=r"D:\claude projects\graphify-ekotizim\Promtlarim\prompts",
         help="Chiqish papkasi yo'li (Promtlarim/prompts)",
     )
     parser.add_argument(

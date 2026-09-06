@@ -162,8 +162,8 @@ async def cmd_search(message: Message) -> None:
         
     lines = [f"🔍 Qidiruv natijalari (<b>{html.escape(query)}</b>):", ""]
     for r in results:
-        sim = int(r.get("similarity", 0) * 100)
-        lines.append(f"• <b>{html.escape(r.get('title', ''))}</b> ({sim}%)")
+        sim = float(r.get("raw_similarity", r.get("similarity", 0)))
+        lines.append(f"• <b>{html.escape(r.get('title', ''))}</b> (yaqinlik {sim:.2f})")
         lines.append(f"  <i>{html.escape(r.get('kind', ''))}</i> | <code>{html.escape(r.get('shortcode', ''))}</code>")
         if r.get("source"):
             lines.append(f"  🔗 <a href=\"{html.escape(r['source'], quote=True)}\">Manba</a>")
