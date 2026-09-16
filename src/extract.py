@@ -276,6 +276,17 @@ def extract(transcript: str, caption: str, onscreen: str, meta: dict) -> dict:
     if _last_vision_fallback:
         flags.append("vision: ollama-fallback")
         _last_vision_fallback = False
+    # Havola tekshirish bloki (GitHub link verify)
+    if getattr(config, "LINK_VERIFY", True):
+        try:
+            from . import link_verify
+            link_verify.verify_links_in_items(
+                items=data["items"],
+                source_text=source_text,
+                title=data.get("title_en", ""),
+            )
+        except Exception as e:
+            log.warning("Havolani tekshirishda xatolik (konveyer davom etadi): %s", e)
 
     # Nom tekshirish bloki
     if getattr(config, "VERIFY_NAMES", True):
@@ -293,6 +304,10 @@ def extract(transcript: str, caption: str, onscreen: str, meta: dict) -> dict:
             if item.get("kind") != "prompt":
                 name = item.get("name_en", "")
                 if not name:
+                    continue
+                if item.get("source_url"):
+                    continue
+                if item.get("rate_limited"):
                     continue
                 if name in tools_cache:
                     cached = tools_cache[name]
@@ -357,6 +372,13 @@ def extract(transcript: str, caption: str, onscreen: str, meta: dict) -> dict:
                 item["verified"] = bool(item.get("source_url"))
             else:
                 item["verified"] = True
+
+    # `rate_limited` — VAQTINCHALIK holat ("bu safar GitHub limiti tufayli
+    # tekshira olmadik"), arxivga yozilmasligi kerak: arxiv doimiy yozuv va
+    # limit o'tib ketgandan keyin ham u yerda muzlab qolardi. Nom tekshirish
+    # bloki uni yuqorida allaqachon o'qib bo'ldi.
+    for item in data.get("items", []):
+        item.pop("rate_limited", None)
 
     data["source_text"] = source_text
     data["flags"] = flags

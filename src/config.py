@@ -30,6 +30,13 @@ VERTEX_MODEL = os.getenv("VERTEX_MODEL", "gemini-3.7-flash")
 VERTEX_TIMEOUT = int(os.getenv("VERTEX_TIMEOUT", "120"))
 VERIFY_NAMES = os.getenv("VERIFY_NAMES", "1") not in ("0", "false", "False", "")
 TOOLS_CACHE_ERROR_TTL_SEC = int(os.getenv("TOOLS_CACHE_ERROR_TTL_SEC", "86400"))
+LINK_VERIFY = os.getenv("LINK_VERIFY", "1") not in ("0", "false", "False", "")
+LINK_VERIFY_MAX_REPOS = int(os.getenv("LINK_VERIFY_MAX_REPOS", "5"))
+LINK_VERIFY_TIMEOUT = int(os.getenv("LINK_VERIFY_TIMEOUT", "8"))
+LINK_VERIFY_TOTAL_TIMEOUT = int(os.getenv("LINK_VERIFY_TOTAL_TIMEOUT", "20"))
+LINKS_CACHE_TTL_FOUND_SEC = int(os.getenv("LINKS_CACHE_TTL_FOUND_SEC", str(30 * 86400)))
+LINKS_CACHE_TTL_NOT_FOUND_SEC = int(os.getenv("LINKS_CACHE_TTL_NOT_FOUND_SEC", str(7 * 86400)))
+LINKS_CACHE_TTL_ERROR_SEC = int(os.getenv("LINKS_CACHE_TTL_ERROR_SEC", "3600"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 # 8192 fits gemma4:12b fully in an 8GB card alongside its KV cache; a larger
 # context (e.g. 32768) pushes part of the model onto the CPU and makes every
@@ -80,6 +87,7 @@ DATA_DIR = ROOT / "data"
 MEDIA_DIR = DATA_DIR / "media"
 QUEUE_DB = DATA_DIR / "jobs.sqlite3"
 LOG_DIR = DATA_DIR / "logs"
+LINKS_CACHE_FILE = DATA_DIR / "links_cache.json"
 
 # Portable by default: the archive lives inside this repo's own data/ folder
 # unless overridden. No machine-specific path is baked in.
