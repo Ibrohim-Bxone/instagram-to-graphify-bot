@@ -181,6 +181,14 @@ def _render_broadcast(rec: dict, author: str) -> str:
     return _cut_on_line_boundary(text, BROADCAST_MAX_CHARS, hint=hint)
 
 
+_INACTIVE_ERR_MARKERS = ("chat not found", "bot was blocked", "user is deactivated")
+
+
+def _is_inactive_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in _INACTIVE_ERR_MARKERS)
+
+
 async def _broadcast(bot: Bot, rec: dict, exclude_chat_id: int, author: str) -> None:
     """Tell every other member that something new landed.
 
@@ -214,14 +222,54 @@ async def _broadcast(bot: Bot, rec: dict, exclude_chat_id: int, author: str) -> 
         except Exception as e:
             failed += 1
             log.warning("broadcast to %s failed: %s", uid, e)
+            if _is_inactive_error(e):
+                users.mark_inactive(uid, reason=str(e)[:200])
     log.info("broadcast: %s -> %d yuborildi, %d yetmadi", rec.get("shortcode", ""),
              sent, failed)
+
+
+async def maybe_alert_inactive_users(bot: Bot) -> None:
+    """7 kunda bir marta adminga faolsiz / start bosmagan foydalanuvchilar ro'yxatini yuboradi."""
+    try:
+        last_str = queue_db.get_setting("last_inactive_alert_at")
+        last_time = float(last_str) if last_str else 0.0
+        now = time.time()
+        if now - last_time < 7 * 86400:
+            return
+
+        inactive = queue_db.get_inactive_users()
+        if not inactive:
+            queue_db.set_setting("last_inactive_alert_at", str(now))
+            return
+
+        lines = ["⚠️ <b>Faolsiz / start bosmagan foydalanuvchilar (haftalik hisobot):</b>", ""]
+        for u in inactive:
+            reason = u.get("reason") or "noma'lum"
+            lines.append(f"• <code>{u['user_id']}</code>: {html.escape(reason)}")
+        text = "\n".join(lines)
+
+        for aid in users.admins():
+            try:
+                await bot.send_message(aid, text)
+            except Exception:
+                log.warning("could not send inactive alert to admin %s", aid)
+        queue_db.set_setting("last_inactive_alert_at", str(now))
+    except Exception:
+        log.exception("error checking inactive users alert")
 
 
 async def worker(bot: Bot) -> None:
     """Single sequential worker: whisper and Ollama cannot share 8GB of VRAM."""
     loop = asyncio.get_running_loop()
+    heartbeat_file = config.DATA_DIR / "worker.heartbeat"
     while True:
+        try:
+            heartbeat_file.write_text(str(time.time()), encoding="utf-8")
+        except Exception:
+            pass
+
+        await maybe_alert_inactive_users(bot)
+
         job = queue_db.claim_next()
         if job is None:
             await asyncio.sleep(3)
@@ -237,14 +285,77 @@ async def worker(bot: Bot) -> None:
             )
 
         try:
+            job.setdefault("defer_count", 0)
             job["_defer_measure"] = True
-            record = await loop.run_in_executor(None, lambda: pipeline.process(job, progress, keep_media=True))
+            process_coro = loop.run_in_executor(None, lambda: pipeline.process(job, progress, keep_media=True))
+            record = await asyncio.wait_for(process_coro, timeout=config.JOB_TIMEOUT_SEC)
             # Marked done the moment the work is done. Everything below is
             # delivery — a caption Telegram refuses, or a video over the upload
             # limit, must not roll a finished job back into the queue and re-run
             # a 15-minute download+whisper+Ollama pass over already-saved output.
             queue_db.finish(job["id"], {"kb_rows": record.get("kb_rows", 0),
                                         "md_path": record.get("md_path", "")})
+        except queue_db.JobDeferred as e:
+            sec = e.retry_after_sec or config.QUOTA_DEFER_SEC
+            queue_db.defer(job["id"], sec)
+            k = (job.get("defer_count", 0) or 0) + 1
+            max_defers = config.QUOTA_MAX_DEFERS
+            minutes = max(1, round(sec / 60))
+            defer_msg = f"⏳ Vertex kvotasi band — {minutes} daqiqadan keyin ({k}/{max_defers})"
+            try:
+                await bot.edit_message_text(
+                    chat_id=job["chat_id"], message_id=job["message_id"],
+                    text=defer_msg,
+                )
+            except Exception:
+                log.warning("could not report defer for %s", job["id"])
+
+            subscribers = queue_db.get_subscribers(job["id"])
+            for sub in subscribers:
+                if sub["chat_id"] == job["chat_id"] and sub.get("message_id") == job["message_id"]:
+                    continue
+                try:
+                    if sub.get("message_id"):
+                        await bot.edit_message_text(
+                            chat_id=sub["chat_id"], message_id=sub["message_id"],
+                            text=defer_msg,
+                        )
+                    else:
+                        await bot.send_message(chat_id=sub["chat_id"], text=defer_msg)
+                except Exception:
+                    pass
+            continue
+        except (asyncio.TimeoutError, TimeoutError):
+            log.warning("job %s timed out after %ds", job["id"], config.JOB_TIMEOUT_SEC)
+            queue_db.fail(job["id"], f"Job timed out after {config.JOB_TIMEOUT_SEC}s", retry=False)
+            timeout_msg = (
+                f"❌ <code>{html.escape(job['shortcode'])}</code> — to'xtatildi\n"
+                f"<i>Vaqt chegarasidan oshdi ({config.JOB_TIMEOUT_SEC}s)</i>"
+            )
+            try:
+                await bot.edit_message_text(
+                    chat_id=job["chat_id"], message_id=job["message_id"],
+                    text=timeout_msg,
+                )
+            except Exception:
+                log.warning("could not report timeout for %s", job["id"])
+
+            subscribers = queue_db.get_subscribers(job["id"])
+            for sub in subscribers:
+                if sub["chat_id"] == job["chat_id"] and sub.get("message_id") == job["message_id"]:
+                    continue
+                try:
+                    if sub.get("message_id"):
+                        await bot.edit_message_text(
+                            chat_id=sub["chat_id"], message_id=sub["message_id"],
+                            text=timeout_msg,
+                        )
+                    else:
+                        await bot.send_message(chat_id=sub["chat_id"], text=timeout_msg)
+                except Exception:
+                    pass
+            queue_db.clear_subscribers(job["id"])
+            continue
         except Exception as e:
             log.exception("job %s failed", job["id"])
             status = queue_db.fail(job["id"], f"{type(e).__name__}: {e}")
@@ -255,15 +366,38 @@ async def worker(bot: Bot) -> None:
             markup = None
             if status == "failed" and archive.path_for(job["shortcode"]).exists():
                 markup = _keyboard(job["shortcode"])
+            fail_msg = (
+                f"❌ <code>{html.escape(job['shortcode'])}</code> — {note}\n"
+                f"<i>{html.escape(str(e)[:300])}</i>"
+            )
             try:
                 await bot.edit_message_text(
                     chat_id=job["chat_id"], message_id=job["message_id"],
-                    text=f"❌ <code>{html.escape(job['shortcode'])}</code> — {note}\n"
-                         f"<i>{html.escape(str(e)[:300])}</i>",
+                    text=fail_msg,
                     reply_markup=markup,
                 )
             except Exception:
                 log.warning("could not report failure for %s", job["id"])
+
+            subscribers = queue_db.get_subscribers(job["id"])
+            for sub in subscribers:
+                if sub["chat_id"] == job["chat_id"] and sub.get("message_id") == job["message_id"]:
+                    continue
+                try:
+                    if sub.get("message_id"):
+                        await bot.edit_message_text(
+                            chat_id=sub["chat_id"], message_id=sub["message_id"],
+                            text=fail_msg, reply_markup=markup,
+                        )
+                    else:
+                        await bot.send_message(
+                            chat_id=sub["chat_id"],
+                            text=fail_msg, reply_markup=markup,
+                        )
+                except Exception:
+                    pass
+            if status == "failed":
+                queue_db.clear_subscribers(job["id"])
             continue
 
         t_tg_start = time.perf_counter()
@@ -359,6 +493,29 @@ async def worker(bot: Bot) -> None:
                 tg_elapsed = time.perf_counter() - t_tg_start
                 tracker.bosqichlar["arxiv_va_telegram"] = round(tracker.bosqichlar["arxiv_va_telegram"] + tg_elapsed, 3)
                 tracker.write_to_file()
+
+        # Natijani obunachilarga ham yuboramiz (A3)
+        subscribers = queue_db.get_subscribers(job["id"])
+        for sub in subscribers:
+            if sub["chat_id"] == job["chat_id"] and sub.get("message_id") == job["message_id"]:
+                continue
+            try:
+                if sub.get("message_id"):
+                    await bot.edit_message_text(
+                        chat_id=sub["chat_id"],
+                        message_id=sub["message_id"],
+                        text=_render_result(record),
+                        reply_markup=_keyboard(job["shortcode"]),
+                    )
+                else:
+                    await bot.send_message(
+                        chat_id=sub["chat_id"],
+                        text=_render_result(record),
+                        reply_markup=_keyboard(job["shortcode"]),
+                    )
+            except Exception:
+                log.warning("could not deliver result to subscriber %s for %s", sub["chat_id"], job["id"])
+        queue_db.clear_subscribers(job["id"])
 
         # Fire and forget: awaiting this held the single worker for as long as
         # the fan-out took, so nobody's next video started until everyone had

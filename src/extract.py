@@ -72,6 +72,7 @@ matters: it gets compared word-for-word against the extracted prompts later."""
 
 
 _last_vision_fallback: bool = False
+_last_vision_usage: dict = {}
 
 
 def _ensure_tracker_patched() -> None:
@@ -136,7 +137,8 @@ def _read_frames_ollama(frame_paths: list, msg: list) -> str:
 
 
 def read_frames(frame_paths: list, flags: list | None = None) -> str:
-    global _last_vision_fallback
+    global _last_vision_fallback, _last_vision_usage
+    _last_vision_usage = {}
     _ensure_tracker_patched()
     if not frame_paths:
         _last_vision_fallback = False
@@ -152,6 +154,7 @@ def read_frames(frame_paths: list, flags: list | None = None) -> str:
         for attempt in range(2):
             try:
                 result = vertex.chat_vision(msg, frame_paths)
+                _last_vision_usage = getattr(vertex, "last_usage", {}).copy()
                 break
             except vertex.VertexError as e:
                 log.warning("Vertex vision urunishi %d muvaffaqiyatsiz: %s", attempt + 1, e)
@@ -222,7 +225,7 @@ def _clean_items(items: list) -> None:
     items[:] = cleaned
 
 
-def extract(transcript: str, caption: str, onscreen: str, meta: dict) -> dict:
+def extract(transcript: str, caption: str, onscreen: str, meta: dict, job: dict | None = None) -> dict:
     source_parts = []
     if caption:
         source_parts.append(f"### Instagram caption\n{caption}")
@@ -245,27 +248,57 @@ def extract(transcript: str, caption: str, onscreen: str, meta: dict) -> dict:
     if config.EXTRACT_BACKEND == "vertex":
         from . import vertex
         data = None
+        last_error = None
         for attempt in range(2):
             try:
                 data = vertex.chat_json(messages, _EXTRACT_SCHEMA)
                 break
             except vertex.VertexError as e:
+                last_error = e
                 log.warning("Vertex urunishi %d muvaffaqiyatsiz: %s", attempt + 1, e)
                 if attempt == 0:
                     time.sleep(2)
         
         if data is None:
-            log.warning("⚠️ Vertex ishlamadi (barcha urinishlar barbod) — %s ga o'tildi", config.MODEL_EXTRACT)
-            data = llm.chat_json(config.MODEL_EXTRACT, messages, _EXTRACT_SCHEMA)
-            fallback_flag = "llm: gemma4-fallback"
+            # 429 kvota xatosi bo'lsa kechiktirish siyosati (B17)
+            if isinstance(last_error, vertex.VertexQuotaError):
+                job_dict = job if isinstance(job, dict) else (meta.get("job") if isinstance(meta, dict) and isinstance(meta.get("job"), dict) else {})
+                defer_count = int(job_dict.get("defer_count", 0) or 0)
+                max_defers = getattr(config, "QUOTA_MAX_DEFERS", 3)
+                if job_dict and defer_count < max_defers:
+                    defer_sec = getattr(config, "QUOTA_DEFER_SEC", 600)
+                    from . import queue_db
+                    raise queue_db.JobDeferred(
+                        retry_after_sec=defer_sec,
+                        message=f"Vertex 429 kvotasi band — {defer_sec}s kechiktirildi ({defer_count + 1}/{max_defers})"
+                    )
+
+            fallback_model = getattr(config, "MODEL_EXTRACT_FALLBACK", "qwen3.6")
+            log.warning("⚠️ Vertex ishlamadi (barcha urinishlar barbod) — %s ga o'tildi", fallback_model)
+            data = llm.chat_json(fallback_model, messages, _EXTRACT_SCHEMA)
+            fallback_flag = f"llm: {fallback_model}-fallback"
         else:
             fallback_flag = None
+
     else:
         data = llm.chat_json(config.MODEL_EXTRACT, messages, _EXTRACT_SCHEMA)
         fallback_flag = None
 
     if not isinstance(data, dict):
         data = {}
+
+    global _last_vision_usage
+    if _last_vision_usage and isinstance(data, dict):
+        u = data.get("usageMetadata")
+        if not u:
+            u = {}
+            data["usageMetadata"] = u
+        u["promptTokenCount"] = u.get("promptTokenCount", 0) + _last_vision_usage.get("promptTokenCount", 0)
+        u["candidatesTokenCount"] = u.get("candidatesTokenCount", 0) + _last_vision_usage.get("candidatesTokenCount", 0)
+        u["totalTokenCount"] = u.get("totalTokenCount", 0) + _last_vision_usage.get("totalTokenCount", 0)
+        if "thoughtsTokenCount" in _last_vision_usage:
+            u["thoughtsTokenCount"] = u.get("thoughtsTokenCount", 0) + _last_vision_usage.get("thoughtsTokenCount", 0)
+
     if not isinstance(data.get("items"), list):
         data["items"] = []
     data["items"] = [i for i in data["items"] if isinstance(i, dict)]

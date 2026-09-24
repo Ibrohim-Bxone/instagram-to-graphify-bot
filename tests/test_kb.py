@@ -1,4 +1,4 @@
-﻿import pytest
+import pytest
 
 import sys
 
@@ -7,23 +7,14 @@ from pathlib import Path
 
 
 # Mock config to test kb in isolation
-
 class MockConfig:
-
-    GRAPHIFY_DIR = Path("D:/claude projects/graphify-ekotizim/Graphify")
-
+    GRAPHIFY_DIR = Path(__file__).parent.parent.parent / "Graphify"
     STANDALONE_KB_DIR = Path("test_db")
-
     PROJECT_LABEL = "test"
 
-
-
 import src.config
-
 src.config.GRAPHIFY_DIR = MockConfig.GRAPHIFY_DIR
-
 src.config.STANDALONE_KB_DIR = MockConfig.STANDALONE_KB_DIR
-
 src.config.PROJECT_LABEL = MockConfig.PROJECT_LABEL
 
 

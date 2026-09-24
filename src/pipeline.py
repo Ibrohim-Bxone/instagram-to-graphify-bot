@@ -41,6 +41,11 @@ class _OlchovTracker:
         self.video_uzunligi = 0.0
         self.transkript_belgi = 0
         self.llm_backend = "vertex" if getattr(config, "EXTRACT_BACKEND", "") == "vertex" else getattr(config, "MODEL_EXTRACT", "gemma4:12b")
+        self.prompt_tokens = 0
+        self.candidates_tokens = 0
+        self.thoughts_tokens = 0
+        self.total_tokens = 0
+        self.usage_metadata = {}
         self.written = False
 
     def start_stage(self, name: str):
@@ -81,12 +86,33 @@ class _OlchovTracker:
         transcript = record.get("transcript") or ""
         self.transkript_belgi = len(transcript)
         flags = record.get("flags") or []
-        if "llm: gemma4-fallback" in flags:
+        fallback_flag = next((f for f in flags if f.startswith("llm: ") and f.endswith("-fallback")), None)
+        if fallback_flag:
+            self.llm_backend = fallback_flag[5:]
+        elif "llm: gemma4-fallback" in flags:
             self.llm_backend = "gemma4-fallback"
         elif getattr(config, "EXTRACT_BACKEND", "") == "vertex":
             self.llm_backend = "vertex"
         else:
             self.llm_backend = getattr(config, "MODEL_EXTRACT", "gemma4:12b")
+
+        # IK-05: usageMetadata tokenlarini hisobga olish
+        usage = record.get("usageMetadata") or record.get("usage_metadata") or {}
+        if usage:
+            self.usage_metadata = usage
+            self.prompt_tokens = usage.get("promptTokenCount", self.prompt_tokens)
+            self.candidates_tokens = usage.get("candidatesTokenCount", self.candidates_tokens)
+            self.thoughts_tokens = usage.get("thoughtsTokenCount", self.thoughts_tokens)
+            self.total_tokens = usage.get("totalTokenCount", self.total_tokens)
+        else:
+            if record.get("prompt_tokens"):
+                self.prompt_tokens = record.get("prompt_tokens", 0)
+            if record.get("candidates_tokens"):
+                self.candidates_tokens = record.get("candidates_tokens", 0)
+            if record.get("thoughts_tokens"):
+                self.thoughts_tokens = record.get("thoughts_tokens", 0)
+            if record.get("total_tokens"):
+                self.total_tokens = record.get("total_tokens", 0)
 
     def to_dict(self) -> dict:
         jami = round(sum(self.bosqichlar.values()), 3)
@@ -110,6 +136,14 @@ class _OlchovTracker:
             "transkript_belgi": self.transkript_belgi,
             "llm_backend": self.llm_backend,
         }
+        if self.prompt_tokens or self.candidates_tokens or self.total_tokens:
+            entry["prompt_tokens"] = self.prompt_tokens
+            entry["candidates_tokens"] = self.candidates_tokens
+            if self.thoughts_tokens:
+                entry["thoughts_tokens"] = self.thoughts_tokens
+            entry["total_tokens"] = self.total_tokens
+        if self.usage_metadata:
+            entry["usageMetadata"] = self.usage_metadata
         if self.xato:
             entry["xato"] = self.xato
         return entry
@@ -144,7 +178,7 @@ def _base_record(sc: str, job: dict, media: dict, author_id: str = "", author_na
         "uploader": media.get("uploader", ""),
         "duration": media.get("duration", 0),
         "caption": media.get("caption", ""),
-        "transcript": "", "language": "", "language_probability": 0.0,
+        "transcript": "", "language": "", "language_detected": "", "language_probability": 0.0,
         "onscreen": "", "date": date.today().isoformat(),
         "title_en": "", "content_type": "other", "summary_uz": [], "tags_en": [],
         "items": [], "apply_suggestions_uz": [], "usable": False,
@@ -161,8 +195,17 @@ def _finish(job: dict, record: dict, media: dict, cleanup, dry_run: bool = False
     if tracker:
         tracker.start_stage("ajratish")
     try:
-        data = extract.extract(record["transcript"], record["caption"], record["onscreen"], media)
+        try:
+            data = extract.extract(record["transcript"], record["caption"], record["onscreen"], media, job=job)
+        except TypeError:
+            data = extract.extract(record["transcript"], record["caption"], record["onscreen"], media)
         record.update({k: v for k, v in data.items() if k != "source_text"})
+        if tracker:
+            tracker.update_from_record(record)
+    except queue_db.JobDeferred:
+        if tracker:
+            tracker.record_error("ajratish")
+        raise
     except Exception:
         if tracker:
             tracker.record_error("ajratish")
@@ -204,6 +247,25 @@ def _finish(job: dict, record: dict, media: dict, cleanup, dry_run: bool = False
                         top_k=1, project=config.PROJECT_LABEL, kind="summary",
                         exclude_shortcode=record["shortcode"],
                     )
+                    if not matches:
+                        try:
+                            col = kb._collection()
+                            q_text = f"{record.get('title_en','')} {' '.join(record.get('summary_uz', []))}".strip()
+                            where = {
+                                "$and": [
+                                    {"project": config.PROJECT_LABEL},
+                                    {"kind": "summary"},
+                                    {"shortcode": {"$ne": record["shortcode"]}},
+                                ]
+                            }
+                            res = col.query(query_texts=[q_text], n_results=1, where=where)
+                            if res and res.get("ids") and res["ids"][0]:
+                                dist = res["distances"][0][0]
+                                sim = max(0.0, 1.0 - dist)
+                                meta_item = res["metadatas"][0][0] if res.get("metadatas") and res["metadatas"][0] else {}
+                                matches = [{"id": res["ids"][0][0], "similarity": sim, **meta_item}]
+                        except Exception:
+                            pass
                 except Exception as e:
                     log.warning("duplicate check skipped for %s: %s", record["shortcode"], e)
                     record["flags"].append("dedup_skipped")
@@ -299,6 +361,8 @@ def _process_video_stages(job: dict, progress, dry_run: bool, keep_media: bool, 
                 transcribe.unload()
                 record.update(transcript=tr["text"], language=tr["language"],
                               language_probability=tr["language_probability"])
+                if tr.get("language_detected"):
+                    record["language_detected"] = tr["language_detected"]
                 if not tr["text"]:
                     record["flags"].append("no_speech")
                 elif tr["language_probability"] < 0.6:

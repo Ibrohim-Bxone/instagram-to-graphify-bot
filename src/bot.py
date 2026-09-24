@@ -60,10 +60,26 @@ def _may_modify(user_id: int, shortcode: str) -> bool:
 async def _deliver_existing(status, shortcode: str) -> None:
     """A second member sending the same thing must still see the result.
 
-    The queue rejects the duplicate job (the work is already done), but the
-    sender used to get only a bare "already known" line and no way to reach
-    the entry — which is exactly the awareness gap this bot exists to close.
+    The queue rejects the duplicate job, but we check its status:
+    - queued/running: saves sender to job_subscribers, notifies user.
+    - failed: requeues job (attempts=0, error=NULL) and notifies user.
+    - done + archive: delivers result as before.
+    - done + no archive: polite message.
     """
+    job = queue_db.get_by_shortcode(shortcode)
+    job_status = job.get("status") if job else None
+
+    if job_status in ("queued", "running"):
+        if job:
+            queue_db.add_subscriber(job["id"], status.chat.id, status.message_id)
+        return await status.edit_text("⏳ hozir ishlanmoqda, tayyor bo'lganda natija yuboriladi")
+
+    if job_status == "failed":
+        if job:
+            queue_db.requeue_job(job["id"])
+            queue_db.add_subscriber(job["id"], status.chat.id, status.message_id)
+        return await status.edit_text("🔁 qayta navbatga qo'ydim")
+
     rec = archive.read(archive.path_for(shortcode))
     if rec is None:
         return await status.edit_text(
@@ -83,6 +99,7 @@ async def _deliver_existing(status, shortcode: str) -> None:
 
 @dp.message(Command("start", "help"))
 async def cmd_start(message: Message) -> None:
+    users.mark_active(message.from_user.id)
     if not _allowed(message.from_user.id):
         return await message.answer(f"Ruxsat yo'q. Sizning ID: <code>{message.from_user.id}</code>")
     await message.answer(

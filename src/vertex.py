@@ -12,24 +12,46 @@ from . import config
 
 log = logging.getLogger(__name__)
 
-# Sozlamalar muhit o'zgaruvchilaridan olinadi. Qattiq yozilgan mashina yo'li
-# (C:\Users\<nom>\...) boshqa kompyuterda ishlamaydi va ochiq repoda foydalanuvchi
-# nomini oshkor qiladi — shuning uchun .env orqali beriladi.
-PROJ = os.getenv("VERTEX_PROJECT", "")
-LOC = os.getenv("VERTEX_LOCATION", "global")
 API = "v1beta1"
-# gcloud PATH da bo'lsa oddiy nom yetarli; bo'lmasa .env da to'liq yo'l ko'rsatiladi.
-GCLOUD = os.getenv("GCLOUD_PATH") or shutil.which("gcloud") or "gcloud"
+
+
+def _get_project() -> str:
+    return getattr(config, "VERTEX_PROJECT", "") or os.getenv("VERTEX_PROJECT", "")
+
+
+def _get_location() -> str:
+    return getattr(config, "VERTEX_LOCATION", "global") or os.getenv("VERTEX_LOCATION", "global")
+
+
+def _get_gcloud() -> str:
+    return getattr(config, "GCLOUD_PATH", "") or os.getenv("GCLOUD_PATH") or shutil.which("gcloud") or "gcloud"
+
+
+# Tashqi muvofiqlik uchun modul darajasidagi o'zgaruvchilar
+PROJ = _get_project()
+LOC = _get_location()
+GCLOUD = _get_gcloud()
+
+# Oxirgi Vertex chaqiruvidan olingan usageMetadata
+last_usage = {}
 
 
 class VertexError(RuntimeError):
-    pass
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+class VertexQuotaError(VertexError):
+    def __init__(self, message: str = "Vertex quota exceeded (429)", status: int = 429):
+        super().__init__(message, status=status)
 
 
 def _get_token() -> str:
+    gcloud = _get_gcloud()
     try:
         return subprocess.check_output(
-            [GCLOUD, "auth", "application-default", "print-access-token"], text=True
+            [gcloud, "auth", "application-default", "print-access-token"], text=True
         ).strip()
     except subprocess.CalledProcessError as e:
         raise VertexError(f"gcloud token failed: {e}") from e
@@ -38,11 +60,15 @@ def _get_token() -> str:
 
 
 def chat_json(messages: list, schema: dict) -> dict:
+    global last_usage
     tok = _get_token()
-    model = config.VERTEX_MODEL
+    model = getattr(config, "VERTEX_MODEL", "gemini-3.7-flash")
+    proj = _get_project()
+    loc = _get_location()
+    max_tokens = getattr(config, "VERTEX_MAX_OUTPUT_TOKENS", 8192)
     url = (
-        f"https://aiplatform.googleapis.com/{API}/projects/{PROJ}"
-        f"/locations/{LOC}/publishers/google/models/{model}:generateContent"
+        f"https://aiplatform.googleapis.com/{API}/projects/{proj}"
+        f"/locations/{loc}/publishers/google/models/{model}:generateContent"
     )
 
     system_text = ""
@@ -58,6 +84,7 @@ def chat_json(messages: list, schema: dict) -> dict:
         "contents": [{"role": "user", "parts": user_parts}],
         "generationConfig": {
             "temperature": 0.2,
+            "maxOutputTokens": max_tokens,
             "responseMimeType": "application/json",
             "responseSchema": schema,
         }
@@ -71,7 +98,7 @@ def chat_json(messages: list, schema: dict) -> dict:
         headers={
             "Authorization": f"Bearer {tok}",
             "Content-Type": "application/json; charset=utf-8",
-            "x-goog-user-project": PROJ,
+            "x-goog-user-project": proj,
         }
     )
 
@@ -80,30 +107,51 @@ def chat_json(messages: list, schema: dict) -> dict:
         d = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
-        raise VertexError(f"HTTP {e.code}: {err_body}") from e
+        if e.code == 429:
+            raise VertexQuotaError(f"HTTP 429: {err_body}", status=429) from e
+        raise VertexError(f"HTTP {e.code}: {err_body}", status=e.code) from e
     except (urllib.error.URLError, TimeoutError) as e:
         raise VertexError(f"Network error: {e}") from e
     except Exception as e:
         raise VertexError(f"Unexpected error: {e}") from e
 
+    candidates = d.get("candidates", [])
+    if candidates:
+        finish_reason = candidates[0].get("finishReason")
+        if finish_reason == "MAX_TOKENS":
+            raise VertexError("Vertex javobi kesildi (finishReason=MAX_TOKENS)")
+
     try:
         content = "".join(
-            p.get("text", "") for p in d.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-        )
+            p.get("text", "") for p in candidates[0].get("content", {}).get("parts", [])
+        ) if candidates else ""
         if not content:
             raise VertexError("Empty content from Vertex")
-        return json.loads(content)
+        res = json.loads(content)
+        usage = d.get("usageMetadata", {})
+        last_usage = usage
+        if isinstance(res, dict) and usage:
+            res["usageMetadata"] = usage
+            res["prompt_tokens"] = usage.get("promptTokenCount", 0)
+            res["candidates_tokens"] = usage.get("candidatesTokenCount", 0)
+            res["thoughts_tokens"] = usage.get("thoughtsTokenCount", 0)
+            res["total_tokens"] = usage.get("totalTokenCount", 0)
+        return res
     except (KeyError, IndexError, json.JSONDecodeError) as e:
         raise VertexError(f"Invalid JSON response from Vertex: {e}") from e
 
 
 def chat_vision(messages: list, image_paths: list) -> str:
     """Send video frames and text prompts to Vertex AI Gemini model and return text response."""
+    global last_usage
     tok = _get_token()
-    model = config.VERTEX_MODEL
+    model = getattr(config, "VERTEX_MODEL", "gemini-3.7-flash")
+    proj = _get_project()
+    loc = _get_location()
+    max_tokens = getattr(config, "VERTEX_MAX_OUTPUT_TOKENS", 8192)
     url = (
-        f"https://aiplatform.googleapis.com/{API}/projects/{PROJ}"
-        f"/locations/{LOC}/publishers/google/models/{model}:generateContent"
+        f"https://aiplatform.googleapis.com/{API}/projects/{proj}"
+        f"/locations/{loc}/publishers/google/models/{model}:generateContent"
     )
 
     user_parts = []
@@ -131,6 +179,7 @@ def chat_vision(messages: list, image_paths: list) -> str:
         "contents": [{"role": "user", "parts": user_parts}],
         "generationConfig": {
             "temperature": 0.2,
+            "maxOutputTokens": max_tokens,
         },
     }
     if system_text:
@@ -142,7 +191,7 @@ def chat_vision(messages: list, image_paths: list) -> str:
         headers={
             "Authorization": f"Bearer {tok}",
             "Content-Type": "application/json; charset=utf-8",
-            "x-goog-user-project": PROJ,
+            "x-goog-user-project": proj,
         },
     )
 
@@ -151,29 +200,42 @@ def chat_vision(messages: list, image_paths: list) -> str:
         d = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
-        raise VertexError(f"HTTP {e.code}: {err_body}") from e
+        if e.code == 429:
+            raise VertexQuotaError(f"HTTP 429: {err_body}", status=429) from e
+        raise VertexError(f"HTTP {e.code}: {err_body}", status=e.code) from e
     except (urllib.error.URLError, TimeoutError) as e:
         raise VertexError(f"Network error: {e}") from e
     except Exception as e:
         raise VertexError(f"Unexpected error: {e}") from e
 
+    candidates = d.get("candidates", [])
+    if candidates:
+        finish_reason = candidates[0].get("finishReason")
+        if finish_reason == "MAX_TOKENS":
+            raise VertexError("Vertex javobi kesildi (finishReason=MAX_TOKENS)")
+
     try:
         content = "".join(
-            p.get("text", "") for p in d.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-        )
+            p.get("text", "") for p in candidates[0].get("content", {}).get("parts", [])
+        ) if candidates else ""
         if not content:
             raise VertexError("Empty content from Vertex")
+        last_usage = d.get("usageMetadata", {})
         return content.strip()
     except (KeyError, IndexError) as e:
         raise VertexError(f"Invalid response from Vertex: {e}") from e
 
 
 def verify_tool(name: str) -> dict:
+    global last_usage
     tok = _get_token()
-    model = config.VERTEX_MODEL
+    model = getattr(config, "VERTEX_MODEL", "gemini-3.7-flash")
+    proj = _get_project()
+    loc = _get_location()
+    max_tokens = getattr(config, "VERTEX_MAX_OUTPUT_TOKENS", 8192)
     url = (
-        f"https://aiplatform.googleapis.com/{API}/projects/{PROJ}"
-        f"/locations/{LOC}/publishers/google/models/{model}:generateContent"
+        f"https://aiplatform.googleapis.com/{API}/projects/{proj}"
+        f"/locations/{loc}/publishers/google/models/{model}:generateContent"
     )
 
     tana = {
@@ -181,6 +243,7 @@ def verify_tool(name: str) -> dict:
         "tools": [{"googleSearch": {}}],
         "generationConfig": {
             "temperature": 0.0,
+            "maxOutputTokens": max_tokens,
             "responseMimeType": "application/json",
             "responseSchema": {
                 "type": "object",
@@ -199,7 +262,7 @@ def verify_tool(name: str) -> dict:
         headers={
             "Authorization": f"Bearer {tok}",
             "Content-Type": "application/json; charset=utf-8",
-            "x-goog-user-project": PROJ,
+            "x-goog-user-project": proj,
         }
     )
 
@@ -208,18 +271,27 @@ def verify_tool(name: str) -> dict:
         d = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
-        raise VertexError(f"HTTP {e.code}: {err_body}") from e
+        if e.code == 429:
+            raise VertexQuotaError(f"HTTP 429: {err_body}", status=429) from e
+        raise VertexError(f"HTTP {e.code}: {err_body}", status=e.code) from e
     except (urllib.error.URLError, TimeoutError) as e:
         raise VertexError(f"Network error: {e}") from e
     except Exception as e:
         raise VertexError(f"Unexpected error: {e}") from e
 
+    candidates = d.get("candidates", [])
+    if candidates:
+        finish_reason = candidates[0].get("finishReason")
+        if finish_reason == "MAX_TOKENS":
+            raise VertexError("Vertex javobi kesildi (finishReason=MAX_TOKENS)")
+
     try:
         content = "".join(
-            p.get("text", "") for p in d.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-        )
+            p.get("text", "") for p in candidates[0].get("content", {}).get("parts", [])
+        ) if candidates else ""
         if not content:
             raise VertexError("Empty content from Vertex")
+        last_usage = d.get("usageMetadata", {})
         return json.loads(content)
     except (KeyError, IndexError, json.JSONDecodeError) as e:
         raise VertexError(f"Invalid response from Vertex: {e}") from e

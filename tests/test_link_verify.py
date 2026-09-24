@@ -414,3 +414,70 @@ def test_rate_limited_key_never_reaches_the_archive(tmp_path, monkeypatch):
 
     for item in result["items"]:
         assert "rate_limited" not in item, "vaqtinchalik holat arxivga yozilmasin"
+
+
+# ---------------------------------------------------------------------------
+# 6. B10: Title mosligi va token ajratish testlari
+# ---------------------------------------------------------------------------
+
+def test_identity_matches_disallow_title_match_when_multi_items():
+    repo_info = {"found": True, "full_name": "langchain-ai/langchain", "description": "Building context-aware LLM apps", "topics": []}
+    # allow_title_match=False bo'lganda title bo'yicha moslik ishlamaydi
+    assert link_verify.identity_matches("AI tool", "LangChain bilan ishlash", repo_info, allow_title_match=False) is False
+    # allow_title_match=True bo'lganda ishlaydi
+    assert link_verify.identity_matches("AI tool", "LangChain bilan ishlash", repo_info, allow_title_match=True) is True
+
+
+def test_identity_matches_title_does_not_leak_into_item_tokens():
+    """Element token to'plamiga video sarlavhasi qo'shilmaydi (IK-03)."""
+    repo_info = {
+        "found": True,
+        "full_name": "org/system",
+        "description": "Fast database orchestration engine",
+        "topics": [],
+    }
+    # item_name da faqat "database" (1 ta so'z mos), title da "orchestration" bor.
+    # Agar title tokenlari item tokenlariga qo'shilsa 2 ta bo'lib True bo'lardi,
+    # lekin title qo'shilmagani uchun overlap=1 (<2) bo'lib False bo'lishi shart!
+    assert link_verify.identity_matches("database tool", "great orchestration", repo_info, allow_title_match=False) is False
+
+
+def test_verify_links_in_items_multiple_items_does_not_match_by_title(tmp_path):
+    """Bir nechta element bo'lganda sarlavha so'zlari orqali soxta verified qilinmasligi kerak."""
+    repo_data = {
+        "full_name": "langchain-ai/langchain",
+        "description": "Building context-aware LLM apps",
+        "topics": [],
+    }
+    items = [
+        {"kind": "tool", "name_en": "Tool A"},
+        {"kind": "tool", "name_en": "Tool B"},
+    ]
+    source_text = "Check out https://github.com/langchain-ai/langchain"
+    title = "LangChain full tutorial"
+
+    with patch.object(link_verify, "_fetch_github_api", return_value=repo_data):
+        stats = link_verify.verify_links_in_items(items, source_text, title=title, cache_path=tmp_path / "cache.json")
+        assert stats["matched"] == 0
+        assert "source_url" not in items[0]
+        assert "source_url" not in items[1]
+
+
+def test_verify_links_in_items_single_item_matches_by_title(tmp_path):
+    """Yozuvda bitta element bo'lsa sarlavha bo'yicha moslik ishlaydi."""
+    repo_data = {
+        "full_name": "langchain-ai/langchain",
+        "description": "Building context-aware LLM apps",
+        "topics": [],
+    }
+    items = [
+        {"kind": "tool", "name_en": "AI Tool"},
+    ]
+    source_text = "Check out https://github.com/langchain-ai/langchain"
+    title = "LangChain full tutorial"
+
+    with patch.object(link_verify, "_fetch_github_api", return_value=repo_data):
+        stats = link_verify.verify_links_in_items(items, source_text, title=title, cache_path=tmp_path / "cache.json")
+        assert stats["matched"] == 1
+        assert items[0]["source_url"] == "https://github.com/langchain-ai/langchain"
+

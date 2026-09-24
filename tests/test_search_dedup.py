@@ -60,7 +60,7 @@ def test_pipeline_deduplication(mock_chroma, monkeypatch):
     
     monkeypatch.setattr(pipeline.archive, "write", lambda r: Path(f"/mock/{r['shortcode']}.md"))
     monkeypatch.setattr(kb, "upsert_record", lambda r, author_id="", author_name="": 1)
-    monkeypatch.setattr(pipeline.extract, "extract", lambda t, c, o, m: {"usable": True})
+    monkeypatch.setattr(pipeline.extract, "extract", lambda t, c, o, m, **kwargs: {"usable": True})
     monkeypatch.setattr(pipeline.queue_db, "set_stage", lambda i, s: None)
     
     job = {"id": 1, "shortcode": "dup2", "source_type": "url", "source": "abc"}
@@ -143,3 +143,36 @@ def test_upsert_record_author_collision_preserves_first_author(mock_chroma):
         assert m["first_author"] == "user_alpha"
         assert m["contributors"] == "user_alpha, user_beta"
         assert m["author_names"] == "Alpha, Beta"
+
+
+def test_no_live_db_touch(tmp_path, monkeypatch, mock_chroma):
+    """Test that upserting doesn't touch the live Graphify DB."""
+    import os
+    
+    graphify_dir = Path(__file__).resolve().parent.parent.parent / "Graphify"
+    live_fts = graphify_dir / "kg_db" / "keyword_index.sqlite3"
+    live_lock = graphify_dir / "kg_db" / ".yozuv.lock"
+    
+    orig_fts_mtime = live_fts.stat().st_mtime if live_fts.exists() else None
+    orig_lock_mtime = live_lock.stat().st_mtime if live_lock.exists() else None
+    
+    monkeypatch.setattr(config, "GRAPHIFY_DIR", graphify_dir)
+    
+    record = {
+        "shortcode": "live_test",
+        "title_en": "Test",
+        "content_type": "prompt",
+        "summary_uz": ["Test summary"],
+        "usable": True,
+    }
+    kb.upsert_record(record, author_id="test_user")
+    
+    if orig_fts_mtime is not None:
+        assert live_fts.stat().st_mtime == orig_fts_mtime
+    else:
+        assert not live_fts.exists()
+        
+    if orig_lock_mtime is not None:
+        assert live_lock.stat().st_mtime == orig_lock_mtime
+    else:
+        assert not live_lock.exists()

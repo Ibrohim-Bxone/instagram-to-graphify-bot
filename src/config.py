@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import shutil
 
 from dotenv import load_dotenv
 
@@ -16,9 +17,11 @@ def _ids(raw: str) -> set:
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ALLOWED_USER_IDS = _ids(os.getenv("ALLOWED_USER_IDS", ""))
 # Admins can add/remove users and are the only ones who may run /install.
-# Unset means "whoever was already trusted in .env", which keeps a single-user
-# install working unchanged; an explicit list is what separates the two tiers.
-ADMIN_USER_IDS = _ids(os.getenv("ADMIN_USER_IDS", "")) or set(ALLOWED_USER_IDS)
+# Bo'sh bo'lsa admin yo'q — hech kimga avtomatik admin huquqi berilmaydi.
+ADMIN_USER_IDS = _ids(os.getenv("ADMIN_USER_IDS", ""))
+if not ADMIN_USER_IDS:
+    import logging
+    logging.getLogger("config").warning("ADMIN_USER_IDS bo'sh — admin tayinlanmagan, /install va /users cheklangan")
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 MODEL_EXTRACT = os.getenv("MODEL_EXTRACT", "gemma4:12b")
@@ -125,5 +128,24 @@ TOOLS_DIR = Path(os.getenv("TOOLS_DIR", "") or (DATA_DIR / "tools"))
 SKILLS_DIR = Path(os.getenv("SKILLS_DIR", "") or (DATA_DIR / "skills"))
 INSTALL_TIMEOUT_SEC = int(os.getenv("INSTALL_TIMEOUT_SEC", "600"))
 
+# Ish boshqarish, kvota va qayta urinish sozlamalari
+JOB_TIMEOUT_SEC = int(os.getenv("JOB_TIMEOUT_SEC", "1800"))
+QUOTA_DEFER_SEC = int(os.getenv("QUOTA_DEFER_SEC", "600"))
+QUOTA_MAX_DEFERS = int(os.getenv("QUOTA_MAX_DEFERS", "3"))
+MODEL_EXTRACT_FALLBACK = os.getenv("MODEL_EXTRACT_FALLBACK", "qwen3.6")
+VERTEX_MAX_OUTPUT_TOKENS = int(os.getenv("VERTEX_MAX_OUTPUT_TOKENS", "8192"))
+WHISPER_TURKIC_AS_UZ = os.getenv("WHISPER_TURKIC_AS_UZ", "uz,kk,tr,az,tk,ky,tt,ba")
+
+VERTEX_PROJECT = os.getenv("VERTEX_PROJECT", "")
+VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "global")
+GCLOUD_PATH = os.getenv("GCLOUD_PATH") or shutil.which("gcloud") or "gcloud"
+
 for _d in (DATA_DIR, MEDIA_DIR, LOG_DIR, ARCHIVE_DIR):
     _d.mkdir(parents=True, exist_ok=True)
+
+
+def __getattr__(name: str):
+    if name == "OLCHOV_PATH":
+        return DATA_DIR / "olchov.jsonl"
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+

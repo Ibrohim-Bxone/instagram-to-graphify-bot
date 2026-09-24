@@ -104,7 +104,11 @@ def write(record: dict) -> Path:
 
 
 def read(path: Path) -> dict | None:
-    m = _JSON_BLOCK.search(path.read_text(encoding="utf-8"))
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+    m = _JSON_BLOCK.search(text)
     if not m:
         return None
     try:

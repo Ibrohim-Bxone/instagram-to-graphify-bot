@@ -15,7 +15,7 @@ import json
 import logging
 import threading
 
-from . import config
+from . import config, queue_db
 
 log = logging.getLogger(__name__)
 
@@ -55,10 +55,39 @@ def members() -> set:
         return set(_load())
 
 
+def is_active(user_id: int) -> bool:
+    try:
+        return queue_db.is_user_active(user_id)
+    except Exception:
+        return True
+
+
+def mark_inactive(user_id: int, reason: str = "") -> None:
+    try:
+        queue_db.mark_user_inactive(user_id, reason)
+    except Exception as e:
+        log.warning("users: could not mark inactive %d (%s)", user_id, e)
+
+
+def mark_active(user_id: int) -> None:
+    try:
+        queue_db.mark_user_active(user_id)
+    except Exception as e:
+        log.warning("users: could not mark active %d (%s)", user_id, e)
+
+
+def inactive_user_ids() -> set:
+    try:
+        return {r["user_id"] for r in queue_db.get_inactive_users()}
+    except Exception:
+        return set()
+
+
 def recipients() -> set:
-    """Everyone who may receive a community broadcast: both tiers, one set."""
+    """Everyone who may receive a community broadcast: both tiers, one set, excluding inactive."""
     with _lock:
-        return set(config.ADMIN_USER_IDS) | set(config.ALLOWED_USER_IDS) | set(_load())
+        all_ids = set(config.ADMIN_USER_IDS) | set(config.ALLOWED_USER_IDS) | set(_load())
+    return all_ids - inactive_user_ids()
 
 
 def is_admin(user_id: int) -> bool:

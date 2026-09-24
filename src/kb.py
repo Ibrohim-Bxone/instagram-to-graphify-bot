@@ -80,7 +80,7 @@ def _collection():
 def _get_chunking_module():
     import sys
     from . import config
-    if str(config.GRAPHIFY_DIR) not in sys.path:
+    if config.GRAPHIFY_DIR and str(config.GRAPHIFY_DIR) not in sys.path:
         sys.path.insert(0, str(config.GRAPHIFY_DIR))
     import chunking
     return chunking
@@ -356,47 +356,52 @@ def upsert_record(record: dict, author_id: str = "", author_name: str = "") -> i
     existing_res = _retry(col.get, where={"shortcode": sc}, include=[])
     existing_ids = set(existing_res.get("ids", [])) if existing_res else set()
 
-    _retry(col.upsert,
-           ids=[r[0] for r in rows],
-           documents=[r[1] for r in rows],
-           metadatas=[r[2] for r in rows])
-           
     if _using_graphify():
         import sys
-        if str(config.GRAPHIFY_DIR) not in sys.path:
+        if config.GRAPHIFY_DIR and str(config.GRAPHIFY_DIR) not in sys.path:
             sys.path.insert(0, str(config.GRAPHIFY_DIR))
-        import keyword_index
-        kw_idx = keyword_index.get_index()
-        kw_idx.upsert(
-            [r[0] for r in rows],
-            [r[1] for r in rows],
-            [r[2] for r in rows]
-        )
+        import yozuv
+        
+        def _do_upsert():
+            yozuv.upsert(
+                _collection(),
+                ids=[r[0] for r in rows],
+                documents=[r[1] for r in rows],
+                metadatas=[r[2] for r in rows]
+            )
+        _retry(_do_upsert)
+    else:
+        _retry(col.upsert,
+               ids=[r[0] for r in rows],
+               documents=[r[1] for r in rows],
+               metadatas=[r[2] for r in rows])
         
     # Delete orphaned IDs
     new_ids = set(r[0] for r in rows)
     orphaned_ids = list(existing_ids - new_ids)
     if orphaned_ids:
-        _retry(col.delete, ids=orphaned_ids)
         if _using_graphify():
-            kw_idx.delete(orphaned_ids)
+            def _do_delete_orphans():
+                import yozuv
+                yozuv.delete(_collection(), ids=orphaned_ids)
+            _retry(_do_delete_orphans)
+        else:
+            _retry(col.delete, ids=orphaned_ids)
 
     return len(rows)
 
 
 def delete_shortcode(shortcode: str) -> None:
-    existing_res = _retry(_collection().get, where={"shortcode": shortcode}, include=[])
-    existing_ids = existing_res.get("ids", []) if existing_res else []
-    
-    _retry(_collection().delete, where={"shortcode": shortcode})
-    
-    if _using_graphify() and existing_ids:
+    if _using_graphify():
         import sys
-        if str(config.GRAPHIFY_DIR) not in sys.path:
+        if config.GRAPHIFY_DIR and str(config.GRAPHIFY_DIR) not in sys.path:
             sys.path.insert(0, str(config.GRAPHIFY_DIR))
-        import keyword_index
-        kw_idx = keyword_index.get_index()
-        kw_idx.delete(existing_ids)
+        import yozuv
+        def _do_del():
+            yozuv.delete(_collection(), where={"shortcode": shortcode})
+        _retry(_do_del)
+    else:
+        _retry(_collection().delete, where={"shortcode": shortcode})
 
 
 def count_for(shortcode: str) -> int:
@@ -429,17 +434,19 @@ def search(query: str, top_k: int = 5, project: str | None = None,
         
     if _using_graphify():
         import sys
-        if str(config.GRAPHIFY_DIR) not in sys.path:
+        if config.GRAPHIFY_DIR and str(config.GRAPHIFY_DIR) not in sys.path:
             sys.path.insert(0, str(config.GRAPHIFY_DIR))
         import search_core, keyword_index
         kw_idx = keyword_index.get_index()
-        hybrid_res = search_core.hybrid_search(
-            query=query,
-            collection=col,
-            kw_index=kw_idx,
-            top_k=top_k,
-            where=where if where else None
-        )
+        def _do_hybrid():
+            return search_core.hybrid_search(
+                query=query,
+                collection=_collection(),
+                kw_index=kw_idx,
+                top_k=top_k,
+                where=where if where else None
+            )
+        hybrid_res = _retry(_do_hybrid)
         # hybrid_search might return dict with 'results' key or list
         if isinstance(hybrid_res, dict) and "results" in hybrid_res:
             hybrid_res = hybrid_res["results"]
@@ -472,6 +479,7 @@ def search(query: str, top_k: int = 5, project: str | None = None,
             item = dict(meta)
             item["id"] = doc_id
             item["similarity"] = sim
+            item["raw_similarity"] = sim
             item["snippet"] = snippet
             results.append(item)
             

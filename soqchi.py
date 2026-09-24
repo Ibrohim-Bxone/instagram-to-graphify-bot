@@ -1,14 +1,11 @@
 """Soqchi: botda osilib qolgan ishlarni aniqlab, navbatni ochib yuboruvchi mustaqil kuzatuvchi.
-
-MUHIM — BU SKRIPT NIMA QILA OLMAYDI:
-Skript SQLite bazasidagi yozuvni tuzatadi (status='failed'), lekin OSILGAN PYTHON
-JARAYONINI TO'XTATA OLMAYDI. Ishchi oqim baribir bloklangan holda qoladi.
-Ish 'failed' qilingach, navbat davom etishi uchun botni qayta ishga tushirish
-kerak bo'lishi mumkin.
 """
 
 import argparse
+import os
+import signal
 import sqlite3
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -31,8 +28,108 @@ DB_TIMEOUT_SEC = 5.0
 BUSY_TIMEOUT_MS = 5000
 
 
-def inspect_and_clean(db_path: Path, chegara_min: float, quruq: bool = False) -> None:
+def get_process_cmdline(pid: int) -> str | None:
+    """Tizimdan berilgan PID ning buyruq qatorini oladi."""
+    try:
+        if sys.platform == "win32":
+            cmd = [
+                "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine"
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()
+            return None
+        else:
+            p = Path(f"/proc/{pid}/cmdline")
+            if p.exists():
+                return p.read_text().replace("\x00", " ")
+    except Exception:
+        pass
+    return None
+
+
+def terminate_process(pid: int) -> bool:
+    """Jarayonni to'xtatadi."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except Exception:
+        try:
+            if sys.platform == "win32":
+                res = subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+                return res.returncode == 0
+        except Exception:
+            pass
+        return False
+
+
+def check_worker_heartbeat(project_dir: Path, chegara_min: float, quruq: bool = False) -> None:
+    """Worker heartbeat faylini tekshiradi va eski bo'lsa bot jarayonini to'xtatadi."""
+    heartbeat_file = project_dir / "data" / "worker.heartbeat"
+    lock_file = project_dir / "data" / "bot.lock"
+    chegara_sec = chegara_min * 60.0
+    now = time.time()
+
+    if not heartbeat_file.exists():
+        return
+
+    try:
+        hb_str = heartbeat_file.read_text(encoding="utf-8").strip()
+        hb_time = float(hb_str)
+    except Exception:
+        hb_time = heartbeat_file.stat().st_mtime
+
+    delta_sec = now - hb_time
+    if delta_sec <= chegara_sec:
+        return
+
+    delta_min = int(delta_sec // 60)
+    print(f"  ⚠️ Worker heartbeat {delta_min} daqiqa eski (chegara: {chegara_min} daq).")
+
+    if not lock_file.exists():
+        print("  ℹ️ bot.lock topilmadi, to'xtatiladigan PID yo'q.")
+        return
+
+    try:
+        pid = int(lock_file.read_text(encoding="utf-8").strip())
+    except Exception as e:
+        print(f"  ⚠️ bot.lock faylidan PID o'qib bo'lmadi: {e}", file=sys.stderr)
+        return
+
+    cmdline = get_process_cmdline(pid)
+    if not cmdline:
+        print(f"  ℹ️ PID {pid} tirik emas yoki buyruq qatorini olib bo'lmadi.")
+        return
+
+    # Tekshiruvsiz PID o'ldirish YO'Q!
+    if "src.bot" not in cmdline:
+        print(
+            f"  ⚠️ XAVFSIZLIK: PID {pid} buyruq qatorida 'src.bot' topilmadi "
+            f"('{cmdline[:80]}'). Jarayon to'xtatilmadi!"
+        )
+        return
+
+    if quruq:
+        print(f"  [QURUQ] Osilgan bot aniqlandi (PID {pid}, cmdline: '{cmdline[:60]}...'). To'xtatiladi.")
+    else:
+        print(f"  [TUZATILDI] Osilgan bot jarayoni to'xtatilmoqda: PID {pid} ('{cmdline[:60]}...')")
+        success = terminate_process(pid)
+        if success:
+            print(f"  ✅ PID {pid} to'xtatildi. Watchdog qayta ko'taradi.")
+        else:
+            print(f"  ❌ PID {pid} ni to'xtatib bo'lmadi.", file=sys.stderr)
+
+
+def inspect_and_clean(db_path: Path, chegara_min: float, quruq: bool = False, project_dir: Path | None = None) -> None:
     """Bazadagi ishlarni tekshiradi va belgilangan muddatdan oshgan running ishlarni failed qiladi."""
+    if project_dir is None:
+        project_dir = db_path.parent.parent if db_path.parent.name == "data" else DEFAULT_PROJECT_DIR
+
+    # 1. Heartbeat va jarayon tekshiruvi (B8)
+    check_worker_heartbeat(project_dir, chegara_min, quruq=quruq)
+
+    # 2. Bazadagi osilgan ishlarni tozalash
     now = time.time()
     chegara_sec = chegara_min * 60.0
 
@@ -49,7 +146,7 @@ def inspect_and_clean(db_path: Path, chegara_min: float, quruq: bool = False) ->
         except sqlite3.OperationalError:
             pass
 
-        # 1. Holat hisoboti: done/queued/running/failed sonlari
+        # Holat hisoboti: done/queued/running/failed sonlari
         cur = con.cursor()
         counts = {"done": 0, "queued": 0, "running": 0, "failed": 0}
         for row in cur.execute("SELECT status, COUNT(*) AS c FROM jobs GROUP BY status"):
@@ -63,7 +160,7 @@ def inspect_and_clean(db_path: Path, chegara_min: float, quruq: bool = False) ->
             f"failed={counts.get('failed', 0)}"
         )
 
-        # 2. Osilgan ishlarni topish (status='running' va now - updated_at > chegara)
+        # Osilgan ishlarni topish (status='running' va now - updated_at > chegara)
         cur.execute(
             "SELECT id, shortcode, stage, updated_at FROM jobs "
             "WHERE status = 'running' AND (? - updated_at) > ?",
@@ -157,12 +254,12 @@ def main() -> None:
         )
         try:
             while True:
-                inspect_and_clean(db_path, args.chegara, quruq=args.quruq)
+                inspect_and_clean(db_path, args.chegara, quruq=args.quruq, project_dir=args.dir)
                 time.sleep(args.kutish)
         except KeyboardInterrupt:
             print("\nSoqchi to'xtatildi.")
     else:
-        inspect_and_clean(db_path, args.chegara, quruq=args.quruq)
+        inspect_and_clean(db_path, args.chegara, quruq=args.quruq, project_dir=args.dir)
 
 
 if __name__ == "__main__":

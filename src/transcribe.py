@@ -112,8 +112,12 @@ def unload() -> None:
 
 def transcribe(audio_path: Path) -> dict:
     model = load_model()
-    segments, info = model.transcribe(
-        str(audio_path),
+    turkic = set(
+        x.strip().lower()
+        for x in getattr(config, "WHISPER_TURKIC_AS_UZ", "uz,kk,tr,az,tk,ky,tt,ba").split(",")
+        if x.strip()
+    )
+    common_opts = dict(
         beam_size=5,
         # large-v3 invents repeated sentences over music and silence; VAD plus
         # dropping the previous-text conditioning is what actually stops it.
@@ -122,17 +126,31 @@ def transcribe(audio_path: Path) -> dict:
         condition_on_previous_text=False,
         temperature=[0.0, 0.2, 0.4],
     )
+    segments, info = model.transcribe(str(audio_path), **common_opts)
+    detected_language = (info.language or "").lower()
+    detected_probability = round(float(info.language_probability or 0.0), 3)
+
+    if detected_language in turkic:
+        used_language = "uz"
+        if detected_language != "uz":
+            # Turkiy til aniqlansa (masalan 'kk'), o'zbek tilida transkripsiya qilinadi
+            segments, info = model.transcribe(str(audio_path), language="uz", **common_opts)
+    else:
+        used_language = detected_language
+
     segs = [{"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
             for s in segments if s.text.strip()]
     text = " ".join(s["text"] for s in segs).strip()
     # On a silent track whisper still reports a confident language ("cy", "nn", ...).
     # Recording that would poison the archive, so an empty transcript has no language.
-    language = info.language if text else ""
-    probability = round(float(info.language_probability or 0.0), 3) if text else 0.0
+    language = used_language if text else ""
+    language_detected = detected_language if text else ""
+    probability = detected_probability if text else 0.0
     return {
         "text": text,
         "segments": segs,
         "language": language,
+        "language_detected": language_detected,
         "language_probability": probability,
-        "device": _model_key[1],
+        "device": _model_key[1] if _model_key else "cpu",
     }

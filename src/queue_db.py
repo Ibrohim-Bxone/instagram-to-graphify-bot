@@ -15,6 +15,15 @@ STATUSES = ("queued", "running", "done", "failed")
 STAGES = ("queued", "downloading", "transcribing", "vision", "extracting", "saving", "done")
 MAX_ATTEMPTS = 3
 
+
+class JobDeferred(Exception):
+    """Raised when a job should be deferred (e.g. quota limit)."""
+
+    def __init__(self, retry_after_sec: int = 600, message: str = ""):
+        self.retry_after_sec = int(retry_after_sec)
+        super().__init__(message or f"Job deferred for {self.retry_after_sec}s")
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id           TEXT PRIMARY KEY,
@@ -26,6 +35,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     status       TEXT NOT NULL DEFAULT 'queued',
     stage        TEXT NOT NULL DEFAULT 'queued',
     attempts     INTEGER NOT NULL DEFAULT 0,
+    defer_count  INTEGER NOT NULL DEFAULT 0,
+    not_before   REAL NOT NULL DEFAULT 0,
     error        TEXT,
     result       TEXT,
     created_at   REAL NOT NULL,
@@ -34,6 +45,26 @@ CREATE TABLE IF NOT EXISTS jobs (
     author_name  TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, created_at);
+
+CREATE TABLE IF NOT EXISTS job_subscribers (
+    job_id      TEXT NOT NULL,
+    chat_id     INTEGER NOT NULL,
+    message_id  INTEGER,
+    created_at  REAL NOT NULL,
+    PRIMARY KEY (job_id, chat_id)
+);
+
+CREATE TABLE IF NOT EXISTS user_states (
+    user_id     INTEGER PRIMARY KEY,
+    is_active   INTEGER NOT NULL DEFAULT 1,
+    reason      TEXT,
+    updated_at  REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS bot_settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT
+);
 """
 
 
@@ -57,6 +88,10 @@ def init() -> None:
             con.execute("ALTER TABLE jobs ADD COLUMN author_id TEXT DEFAULT ''")
         if "author_name" not in cols:
             con.execute("ALTER TABLE jobs ADD COLUMN author_name TEXT DEFAULT ''")
+        if "defer_count" not in cols:
+            con.execute("ALTER TABLE jobs ADD COLUMN defer_count INTEGER DEFAULT 0")
+        if "not_before" not in cols:
+            con.execute("ALTER TABLE jobs ADD COLUMN not_before REAL DEFAULT 0")
 
 
 def enqueue(job_id: str, shortcode: str, source_type: str, source: str,
@@ -79,19 +114,143 @@ def get(job_id: str) -> dict | None:
     return dict(row) if row else None
 
 
-def claim_next() -> dict | None:
-    """Take the oldest queued job and mark it running, atomically."""
+def get_by_shortcode(shortcode: str) -> dict | None:
     with _conn() as con:
         row = con.execute(
-            "SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at LIMIT 1"
+            "SELECT * FROM jobs WHERE shortcode = ? ORDER BY created_at DESC LIMIT 1",
+            (shortcode,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def requeue_job(job_id: str) -> bool:
+    """Requeue a failed job with attempts=0 and error=NULL."""
+    now = time.time()
+    with _conn() as con:
+        cur = con.execute(
+            "UPDATE jobs SET status='queued', stage='queued', attempts=0, error=NULL, updated_at=? "
+            "WHERE id=?",
+            (now, job_id),
+        )
+        return cur.rowcount > 0
+
+
+def claim_next() -> dict | None:
+    """Take the oldest queued job that is ready (not_before <= now) and mark it running, atomically."""
+    now = time.time()
+    with _conn() as con:
+        row = con.execute(
+            "SELECT * FROM jobs WHERE status = 'queued' AND not_before <= ? ORDER BY created_at LIMIT 1",
+            (now,),
         ).fetchone()
         if row is None:
             return None
         con.execute(
             "UPDATE jobs SET status='running', attempts=attempts+1, updated_at=? WHERE id=?",
-            (time.time(), row["id"]),
+            (now, row["id"]),
         )
-        return dict(row)
+        job = dict(row)
+        job["status"] = "running"
+        job["attempts"] += 1
+        return job
+
+
+def defer(job_id: str, sec: int) -> None:
+    """Defer job: status -> queued, defer_count+1, not_before=now+sec, attempts does not increase."""
+    now = time.time()
+    with _conn() as con:
+        con.execute(
+            "UPDATE jobs SET "
+            "  status='queued', "
+            "  defer_count=defer_count+1, "
+            "  not_before=?, "
+            "  attempts=MAX(0, attempts-1), "
+            "  updated_at=? "
+            "WHERE id=?",
+            (now + sec, now, job_id),
+        )
+
+
+def add_subscriber(job_id: str, chat_id: int, message_id: int | None = None) -> bool:
+    """Register a user to be notified when this job finishes."""
+    now = time.time()
+    with _conn() as con:
+        cur = con.execute(
+            "INSERT OR REPLACE INTO job_subscribers (job_id, chat_id, message_id, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (job_id, chat_id, message_id, now),
+        )
+        return cur.rowcount > 0
+
+
+def get_subscribers(job_id: str) -> list[dict]:
+    """Get all subscribers for a job."""
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT job_id, chat_id, message_id, created_at FROM job_subscribers "
+            "WHERE job_id = ? ORDER BY created_at ASC",
+            (job_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def clear_subscribers(job_id: str) -> None:
+    """Remove subscribers for a job after delivering results."""
+    with _conn() as con:
+        con.execute("DELETE FROM job_subscribers WHERE job_id = ?", (job_id,))
+
+
+def mark_user_inactive(user_id: int, reason: str = "") -> None:
+    now = time.time()
+    with _conn() as con:
+        con.execute(
+            "INSERT INTO user_states (user_id, is_active, reason, updated_at) "
+            "VALUES (?, 0, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET is_active=0, reason=excluded.reason, updated_at=excluded.updated_at",
+            (user_id, reason, now),
+        )
+
+
+def mark_user_active(user_id: int) -> None:
+    now = time.time()
+    with _conn() as con:
+        con.execute(
+            "INSERT INTO user_states (user_id, is_active, reason, updated_at) "
+            "VALUES (?, 1, NULL, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET is_active=1, reason=NULL, updated_at=excluded.updated_at",
+            (user_id, now),
+        )
+
+
+def is_user_active(user_id: int) -> bool:
+    with _conn() as con:
+        row = con.execute("SELECT is_active FROM user_states WHERE user_id = ?", (user_id,)).fetchone()
+        if row is None:
+            return True
+        return bool(row["is_active"])
+
+
+def get_inactive_users() -> list[dict]:
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT user_id, reason, updated_at FROM user_states WHERE is_active = 0 ORDER BY updated_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_setting(key: str, default: str | None = None) -> str | None:
+    with _conn() as con:
+        row = con.execute("SELECT value FROM bot_settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with _conn() as con:
+        con.execute(
+            "INSERT INTO bot_settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
 
 
 def set_stage(job_id: str, stage: str) -> None:
@@ -161,10 +320,6 @@ def is_timeout_error(exc_or_text: Exception | str) -> bool:
     text = str(exc_or_text).lower()
     if "timeoutexpired" in text:
         return False
-    # Matching the bare word "timeout" swept in anything that merely mentions
-    # it - a URL like /post-timeout-issue, or "invalid option timeout" - and
-    # sent deterministic failures round the retry loop. These markers are the
-    # exception class names and the phrases the libraries actually emit.
     return any(marker in text for marker in _TIMEOUT_TEXT_MARKERS)
 
 
@@ -195,8 +350,6 @@ def requeue_running() -> list[dict]:
     jobs that were transitioned to 'failed' because attempts >= MAX_ATTEMPTS.
     """
     with _conn() as con:
-        # Without the attempts guard a job that hangs the worker gets requeued
-        # on every restart and hangs it again, forever.
         err_msg = "bot qayta ishga tushdi, urinishlar tugadi"
         rows = con.execute(
             "SELECT id, chat_id, message_id, shortcode, error FROM jobs "

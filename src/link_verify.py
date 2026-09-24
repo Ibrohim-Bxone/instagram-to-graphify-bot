@@ -150,11 +150,11 @@ def extract_meaningful_tokens(text: str) -> set[str]:
     return {w for w in words if len(w) > 2 and w not in STOP_WORDS}
 
 
-def identity_matches(item_name: str, title: str, repo_info: dict) -> bool:
+def identity_matches(item_name: str, title: str, repo_info: dict, allow_title_match: bool = True) -> bool:
     """Repo item yoki sarlavhaga mos kelishini tekshiradi.
 
-    - Repo nomi item/sarlavha nomiga AYNAN tushsa True;
-    - Aks holda nom+tavsif+topics bo'yicha kamida 2 ta mazmunli umumiy so'z.
+    - Repo nomi item nomiga (yoki yozuvda yagona element bo'lsa sarlavhaga) AYNAN tushsa True;
+    - Aks holda nom+tavsif+topics bo'yicha kamida 2 ta mazmunli umumiy so'z (element tokenlari).
     """
     if not isinstance(repo_info, dict) or not repo_info.get("found"):
         return False
@@ -174,14 +174,16 @@ def identity_matches(item_name: str, title: str, repo_info: dict) -> bool:
     if clean_repo and len(clean_repo) >= 2:
         if clean_item and clean_repo == clean_item:
             return True
-        if clean_title and clean_repo == clean_title:
-            return True
         if clean_repo in item_words and clean_repo not in STOP_WORDS:
             return True
-        if clean_repo in title_words and clean_repo not in STOP_WORDS:
-            return True
+        if allow_title_match:
+            if clean_title and clean_repo == clean_title:
+                return True
+            if clean_repo in title_words and clean_repo not in STOP_WORDS:
+                return True
 
-    nom_tok = extract_meaningful_tokens(item_name) | extract_meaningful_tokens(title)
+    # B10: Element token to'plamiga video sarlavhasi qo'shilmaydi
+    nom_tok = extract_meaningful_tokens(item_name)
     desc = repo_info.get("description") or ""
     topics = repo_info.get("topics") or []
     topics_str = " ".join(topics) if isinstance(topics, list) else str(topics)
@@ -325,13 +327,16 @@ def verify_links_in_items(
     if cache_updated:
         save_cache(cache, cache_path)
 
+    # Sarlavha bo'yicha moslik faqat yozuvda bitta element bo'lsa (B10)
+    allow_title_match = (len(items) == 1)
+
     # Itemlarga mos havolani bog'lash:
     for item in check_items:
         if item.get("source_url"):
             continue
         item_name = item.get("name_en", "")
         for owner, repo, repo_info in checked_repos:
-            if identity_matches(item_name, title, repo_info):
+            if identity_matches(item_name, title, repo_info, allow_title_match=allow_title_match):
                 full_name = repo_info.get("full_name") or f"{owner}/{repo}"
                 item["source_url"] = f"https://github.com/{full_name}"
                 item["link_verified"] = True
