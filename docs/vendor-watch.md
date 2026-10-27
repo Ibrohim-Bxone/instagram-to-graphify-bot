@@ -7,7 +7,11 @@ Asosiy imkoniyatlari:
 - **Tezkor va xolis saralash (Deterministic Triage):** LLM chaqiruvidan oldin SemVer va kalit so'zlar orqali reliz turini (`new_model`, `breaking`, `security`, `deprecation`, `pricing`, `feature`, `sdk_patch`, `other`) va uning muhimligini (`high` vs `digest`) aniqlaydi.
 - **Dublikatlarni klasterlash:** 24 soat ichida turli manbalarda chiqqan bir xil relizlarni bitta xabarga birlashtiradi.
 - **LLM tahlili va O'zbekcha hisobot:** Vertex AI Gemini orqali relizning foydalanuvchi stekiga (`profile.md`) aniq foydasini, qanday ishlatilishini va cheklovlarini ajratib, o'zbek tilida tayyorlaydi. LLM xato bersa ham "raw mode" orqali yetkazib berish uzilmaydi.
-- **Telegram yetkazish va Outbox:** Tranzaksion outbox orqali xabarlarni saqlaydi va yuboradi. Yuqori muhimlikdagi xabarlar darhol (kuniga 5 tagacha soft-cap, oshsa birlashtirilib), SDK patch'lari esa kunlik dayjest ko'rinishida yuboriladi.
+- **Telegram yetkazish va Outbox:** Tranzaksion outbox va `processing_jobs` orqali xabarlarni xavfsiz saqlaydi. Yuqori muhimlikdagi xabarlar darhol (kuniga 5 tagacha soft-cap, oshsa har biri to'liq qamrab olingan holda bo'lib yuboriladi), SDK patch'lari esa kunlik dayjest ko'rinishida yuboriladi.
+- **Kunlik dayjest avtomatik flush:** `last_digest_date` holati orqali har 6 soatda ishga tushuvchi oddiy `--once` tsikllarida ham kuniga bir marta avtomatik yuboriladi (alohida `--digest` bayrog'i talab etilmaydi).
+- **Xavfsiz Dry-run semantikasi:** `--dry-run` bayrog'i persistent bazani (diskdagi SQLite faylini) o'zgartirmaydi, in-memory nusxada ishlaydi. Real outbox holati va pending xabarlar buzilmaydi.
+- **Pre-reliz shovqinidan tozalash:** `-alpha`, `-beta`, `-rc` versiyalar shovqin deb hisoblanadi va dayjestdan ham, darhol xabarlardan ham chiqarib tashlanadi (agar xavfsizlik yoki breaking change bo'lmasa).
+- **Qabul qiluvchilar bo'yicha mustaqil kuzatuv:** Bir necha chat_id bo'lganda, ularning har biriga yetkazish alohida kuzatiladi va xato yuz berganda faqat bormagan chatlarga qayta urinish qilinadi.
 
 ---
 

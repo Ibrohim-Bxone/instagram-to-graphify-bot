@@ -64,8 +64,10 @@ def load_profile() -> str:
 
 def make_raw_mode(event: dict) -> dict:
     """Create minimal fallback payload if LLM call fails, ensuring delivery never stops."""
+    from .parser import strip_html
     raw = event.get("raw_content") or event.get("summary") or ""
-    snippet = raw[:300].strip()
+    clean_text = strip_html(raw)
+    snippet = clean_text[:300].strip()
     return {
         "uz_title": event.get("title", "Vendor yangilanishi"),
         "uz_summary": snippet or "Yangi reliz e'lon qilindi.",

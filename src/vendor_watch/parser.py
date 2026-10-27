@@ -106,12 +106,13 @@ def parse_feed(content: str | bytes) -> list[FeedEntry]:
                     published = parse_date(ptext)
                 elif ptag == "summary" and not summary:
                     summary = strip_html(ptext)
-                    if not content_val:
-                        content_val = ptext
                 elif ptag == "content" and not content_val:
                     content_val = ptext
-                    if not summary:
-                        summary = strip_html(ptext)
+
+            if not content_val and summary:
+                content_val = summary
+            if not summary and content_val:
+                summary = strip_html(content_val)
 
             if not entry_id:
                 entry_id = link or title
@@ -158,12 +159,13 @@ def parse_feed(content: str | bytes) -> list[FeedEntry]:
                     pub_date = parse_date(ptext)
                 elif ptag == "description" and not description:
                     description = strip_html(ptext)
-                    if not encoded_content:
-                        encoded_content = ptext
-                elif ptag == "encoded" and not encoded_content:
+                elif ptag in ("encoded", "content") and not encoded_content:
                     encoded_content = ptext
-                    if not description:
-                        description = strip_html(ptext)
+
+            if not encoded_content and description:
+                encoded_content = description
+            if not description and encoded_content:
+                description = strip_html(encoded_content)
 
             entry_id = guid or link or title
             if entry_id or title:

@@ -72,6 +72,42 @@ _FEATURE_KEYWORDS = (
     "introducing",
 )
 
+_PRERELEASE_KEYWORDS = (
+    "-alpha",
+    "-beta",
+    "-rc",
+    ".alpha",
+    ".beta",
+    ".rc",
+    "prerelease",
+    "pre-release",
+)
+
+SEVERITY_ORDER = {
+    "security": 100,
+    "breaking": 90,
+    "deprecation": 80,
+    "new_model": 70,
+    "pricing": 60,
+    "feature": 50,
+    "sdk_patch": 40,
+    "other": 30,
+    "prerelease": 20,
+}
+
+
+def is_prerelease(title: str, text: str = "") -> bool:
+    """Check if title or text indicates an alpha/beta/rc/preview pre-release."""
+    full = f"{title} {text}".lower()
+    if any(k in full for k in _PRERELEASE_KEYWORDS):
+        return True
+    match = _SEMVER_RE.search(title) or _SEMVER_RE.search(text)
+    if match and match.group(4):
+        tag = match.group(4).lower()
+        if any(w in tag for w in ("alpha", "beta", "rc", "preview", "canary", "dev")):
+            return True
+    return False
+
 
 def extract_semver(text: str) -> tuple[int, int, int] | None:
     match = _SEMVER_RE.search(text)
@@ -113,13 +149,19 @@ def classify_event(event: dict) -> tuple[str, str]:
     ):
         is_breaking_kw = any(k in full_text for k in _BREAKING_KEYWORDS)
     semver = extract_semver(title) or extract_semver(raw)
+    prerelease_flag = is_prerelease(title, raw) or (event.get("prerelease") is True)
+
     if is_breaking_kw:
         return "breaking", "high"
 
-    if semver:
+    if semver and not prerelease_flag:
         major, minor, patch = semver
         if major >= 2 and minor == 0 and patch == 0:
             return "breaking", "high"
+
+    # Pre-releases are noise unless security or breaking (handled above)
+    if prerelease_flag:
+        return "prerelease", "ignore"
 
     # 4. New model releases -> high
     if any(k in full_text for k in _NEW_MODEL_KEYWORDS):
@@ -147,8 +189,8 @@ def classify_event(event: dict) -> tuple[str, str]:
     return "other", "digest"
 
 
-def _extract_entity_key(title: str, text: str) -> str:
-    """Extract model or release key for cluster matching (e.g. gemini-2.5-flash, v1.50.0)."""
+def _extract_entity_key(title: str, text: str, product: str = "") -> str:
+    """Extract model or release key for cluster matching (e.g. gemini-2.5-flash, or product + v1.50.0)."""
     normalized = re.sub(r"[\s\-_]+", "-", f"{title} {text}".lower())
     # Check model names
     models = (
@@ -165,9 +207,12 @@ def _extract_entity_key(title: str, text: str) -> str:
         if m in normalized:
             return m
 
-    # Check semver
-    sv = extract_semver(title)
+    # Check semver (must include product in the key so different products don't accidentally merge)
+    sv = extract_semver(title) or extract_semver(text)
     if sv:
+        prod_clean = re.sub(r"[\s\-_]+", "-", product.strip().lower())
+        if prod_clean:
+            return f"{prod_clean}:v{sv[0]}.{sv[1]}.{sv[2]}"
         return f"v{sv[0]}.{sv[1]}.{sv[2]}"
 
     return ""
@@ -181,14 +226,14 @@ def _parse_time(ts_str: str) -> float:
 
 
 def cluster_duplicates(events: list[dict]) -> list[dict]:
-    """Cluster duplicate events across sources (same vendor + model/version within 24h)."""
+    """Cluster duplicate events across sources (same vendor + model/product-version within 24h)."""
     if len(events) <= 1:
         return events
 
     clusters: list[list[dict]] = []
     for ev in events:
         vendor = (ev.get("vendor") or "").strip().lower()
-        key = _extract_entity_key(ev.get("title", ""), ev.get("raw_content", ""))
+        key = _extract_entity_key(ev.get("title", ""), ev.get("raw_content", ""), ev.get("product", ""))
         t = _parse_time(ev.get("published_at", ""))
 
         placed = False
@@ -196,7 +241,7 @@ def cluster_duplicates(events: list[dict]) -> list[dict]:
             for cluster in clusters:
                 first = cluster[0]
                 c_vendor = (first.get("vendor") or "").strip().lower()
-                c_key = _extract_entity_key(first.get("title", ""), first.get("raw_content", ""))
+                c_key = _extract_entity_key(first.get("title", ""), first.get("raw_content", ""), first.get("product", ""))
                 c_t = _parse_time(first.get("published_at", ""))
 
                 if vendor == c_vendor and key == c_key:
@@ -217,22 +262,48 @@ def cluster_duplicates(events: list[dict]) -> list[dict]:
                 ev["links"] = [ev["link"]] if ev.get("link") else []
             merged_events.append(ev)
         else:
-            # Merge cluster
+            # Merge cluster: keep all member content and the maximum severity
             primary = cluster[0]
             all_links = []
             all_products = []
+            all_contents = []
+            max_severity = -1
+            best_type = primary.get("triage_type") or "other"
+            best_prio = primary.get("priority") or "digest"
+
             for item in cluster:
                 link = item.get("link")
                 if link and link not in all_links:
                     all_links.append(link)
+                for l in item.get("links", []):
+                    if l and l not in all_links:
+                        all_links.append(l)
+
                 prod = item.get("product")
                 if prod and prod not in all_products:
                     all_products.append(prod)
+
+                content = item.get("raw_content") or item.get("summary") or ""
+                if content and content not in all_contents:
+                    all_contents.append(content)
+
+                itype = item.get("triage_type")
+                iprio = item.get("priority")
+                if not itype or not iprio:
+                    itype, iprio = classify_event(item)
+                rank = SEVERITY_ORDER.get(itype, 10)
+                if rank > max_severity:
+                    max_severity = rank
+                    best_type = itype
+                    best_prio = iprio
 
             merged = dict(primary)
             merged["links"] = all_links
             merged["clustered_sources"] = all_products
             merged["cluster_count"] = len(cluster)
+            merged["raw_content"] = "\n\n---\n\n".join(all_contents) if all_contents else primary.get("raw_content", "")
+            merged["triage_type"] = best_type
+            merged["priority"] = best_prio
             merged_events.append(merged)
 
     return merged_events

@@ -59,7 +59,12 @@ def send_to_telegram(token: str, chat_id: str, text: str, timeout: int = 15) -> 
             raise RuntimeError(f"Telegram API xatosi HTTP {resp.status}")
 
 
-def deliver(text: str, dry_run: bool = False) -> tuple[bool, str]:
+def deliver(
+    text: str,
+    dry_run: bool = False,
+    conn=None,
+    outbox_id: int | None = None,
+) -> tuple[bool, str]:
     """Dispatch message: print to stdout if dry_run, otherwise send to Telegram chats."""
     if dry_run:
         _safe_print("\n" + "=" * 60)
@@ -84,14 +89,27 @@ def deliver(text: str, dry_run: bool = False) -> tuple[bool, str]:
         log.error(err)
         return False, err
 
+    if conn is not None and outbox_id is not None:
+        from . import store
+        store.init_outbox_deliveries(conn, outbox_id, chat_ids)
+        pending_cids = store.get_pending_delivery_chat_ids(conn, outbox_id)
+    else:
+        pending_cids = chat_ids
+
     errors = []
-    for cid in chat_ids:
+    for cid in pending_cids:
         try:
             send_to_telegram(token, cid, text)
+            if conn is not None and outbox_id is not None:
+                from . import store
+                store.record_delivery_attempt(conn, outbox_id, cid, success=True)
         except Exception as e:
             err_msg = f"Chat {cid} ga yuborishda xato: {e}"
             log.error(err_msg)
             errors.append(err_msg)
+            if conn is not None and outbox_id is not None:
+                from . import store
+                store.record_delivery_attempt(conn, outbox_id, cid, success=False, error=str(e))
 
     if errors:
         return False, "; ".join(errors)

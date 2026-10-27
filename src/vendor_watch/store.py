@@ -62,9 +62,36 @@ def _init_schema(conn: sqlite3.Connection) -> None:
                 created_at TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS processing_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT UNIQUE,
+                status TEXT DEFAULT 'pending',
+                attempts INTEGER DEFAULT 0,
+                created_at TEXT,
+                updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS app_state (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS outbox_deliveries (
+                outbox_id INTEGER,
+                chat_id TEXT,
+                status TEXT DEFAULT 'pending',
+                attempts INTEGER DEFAULT 0,
+                last_attempt_at TEXT DEFAULT '',
+                error_message TEXT DEFAULT '',
+                PRIMARY KEY (outbox_id, chat_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_events_source ON events(source_id);
             CREATE INDEX IF NOT EXISTS idx_events_published ON events(published_at);
             CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status);
+            CREATE INDEX IF NOT EXISTS idx_processing_jobs_status ON processing_jobs(status);
+            CREATE INDEX IF NOT EXISTS idx_outbox_deliveries_status ON outbox_deliveries(status);
             """
         )
 
@@ -241,6 +268,14 @@ def record_unseen_entries(
                         now_iso,
                     ),
                 )
+                conn.execute(
+                    """
+                    INSERT INTO processing_jobs (event_id, status, created_at, updated_at)
+                    VALUES (?, 'pending', ?, ?)
+                    ON CONFLICT(event_id) DO UPDATE SET status = 'pending', updated_at = excluded.updated_at
+                    """,
+                    (event_id, now_iso, now_iso),
+                )
                 new_events.append({
                     "id": event_id,
                     "source_id": source_id,
@@ -279,6 +314,14 @@ def record_unseen_entries(
                             now_iso,
                             event_id,
                         ),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO processing_jobs (event_id, status, created_at, updated_at)
+                        VALUES (?, 'pending', ?, ?)
+                        ON CONFLICT(event_id) DO UPDATE SET status = 'pending', updated_at = excluded.updated_at
+                        """,
+                        (event_id, now_iso, now_iso),
                     )
                     new_events.append({
                         "id": event_id,
@@ -391,3 +434,165 @@ def count_today_high_priority(conn: sqlite3.Connection) -> int:
     )
     row = cur.fetchone()
     return int(row["cnt"]) if row else 0
+
+
+def get_pending_processing_jobs(conn: sqlite3.Connection) -> list[dict]:
+    """Retrieve unfinished processing jobs joined with event details."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT pj.id AS job_id, pj.event_id AS event_id, pj.status AS job_status, pj.attempts AS job_attempts,
+               e.*
+        FROM processing_jobs pj
+        JOIN events e ON pj.event_id = e.id
+        WHERE pj.status = 'pending'
+        ORDER BY pj.id ASC
+        """
+    )
+    results = []
+    for row in cur.fetchall():
+        d = dict(row)
+        d["summary"] = d.get("summary") or d.get("raw_content") or ""
+        d["links"] = [d["link"]] if d.get("link") else []
+        results.append(d)
+    return results
+
+
+def mark_processing_job_done(conn: sqlite3.Connection, event_id: str) -> None:
+    now_iso = datetime.now().isoformat()
+    with conn:
+        conn.execute(
+            """
+            UPDATE processing_jobs
+            SET status = 'completed', updated_at = ?
+            WHERE event_id = ?
+            """,
+            (now_iso, event_id),
+        )
+
+
+def mark_processing_job_failed(
+    conn: sqlite3.Connection, event_id: str, error_message: str = ""
+) -> None:
+    now_iso = datetime.now().isoformat()
+    with conn:
+        conn.execute(
+            """
+            UPDATE processing_jobs
+            SET status = 'failed', attempts = attempts + 1, updated_at = ?
+            WHERE event_id = ?
+            """,
+            (now_iso, event_id),
+        )
+
+
+def get_app_state(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM app_state WHERE key = ?", (key,))
+    row = cur.fetchone()
+    return str(row["value"]) if row else default
+
+
+def set_app_state(conn: sqlite3.Connection, key: str, value: str) -> None:
+    now_iso = datetime.now().isoformat()
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO app_state (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (key, str(value), now_iso),
+        )
+
+
+def init_outbox_deliveries(
+    conn: sqlite3.Connection, outbox_id: int, chat_ids: list[str]
+) -> None:
+    with conn:
+        for cid in chat_ids:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO outbox_deliveries (outbox_id, chat_id, status)
+                VALUES (?, ?, 'pending')
+                """,
+                (outbox_id, str(cid)),
+            )
+
+
+def get_pending_delivery_chat_ids(
+    conn: sqlite3.Connection, outbox_id: int
+) -> list[str]:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT chat_id FROM outbox_deliveries
+        WHERE outbox_id = ? AND status != 'sent'
+        ORDER BY chat_id ASC
+        """,
+        (outbox_id,),
+    )
+    return [str(r["chat_id"]) for r in cur.fetchall()]
+
+
+def record_delivery_attempt(
+    conn: sqlite3.Connection,
+    outbox_id: int,
+    chat_id: str,
+    success: bool,
+    error: str = "",
+) -> None:
+    now_iso = datetime.now().isoformat()
+    status = "sent" if success else "failed"
+    with conn:
+        conn.execute(
+            """
+            UPDATE outbox_deliveries
+            SET status = ?, attempts = attempts + 1, last_attempt_at = ?, error_message = ?
+            WHERE outbox_id = ? AND chat_id = ?
+            """,
+            (status, now_iso, error, outbox_id, str(chat_id)),
+        )
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*) AS pending_cnt FROM outbox_deliveries
+            WHERE outbox_id = ? AND status != 'sent'
+            """,
+            (outbox_id,),
+        )
+        row = cur.fetchone()
+        all_sent = (row["pending_cnt"] == 0) if row else False
+        out_status = "sent" if all_sent else "failed"
+        conn.execute(
+            """
+            UPDATE outbox
+            SET status = ?, attempts = attempts + 1, last_attempt_at = ?,
+                error_message = CASE WHEN ? THEN '' ELSE ? END
+            WHERE id = ?
+            """,
+            (out_status, now_iso, all_sent, error, outbox_id),
+        )
+
+
+def get_recent_events_for_clustering(
+    conn: sqlite3.Connection, hours: int = 24
+) -> list[dict]:
+    cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT e.*, o.status as outbox_status
+        FROM events e
+        LEFT JOIN outbox o ON o.event_id = e.id
+        WHERE e.first_seen_at >= ? OR e.published_at >= ?
+        ORDER BY e.first_seen_at DESC
+        """,
+        (cutoff, cutoff),
+    )
+    rows = []
+    for r in cur.fetchall():
+        d = dict(r)
+        d["links"] = [d["link"]] if d.get("link") else []
+        rows.append(d)
+    return rows
