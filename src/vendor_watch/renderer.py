@@ -82,7 +82,13 @@ def render_high_priority_message(event: dict, enrichment: dict) -> str:
     for lnk in links[:5]:
         if lnk:
             cl = lnk.strip()
-            link_lines.append(f"• <a href=\"{html.escape(cl)}\">{html.escape(cl)}</a>")
+            esc_cl = html.escape(cl)
+            if len(esc_cl) <= 250 and len(cl) <= 200:
+                short_lbl = truncate_field(cl, 80)
+                link_lines.append(f'• <a href="{esc_cl}">{html.escape(short_lbl)}</a>')
+            else:
+                short_lbl = truncate_field(cl, 80)
+                link_lines.append(f'• {html.escape(short_lbl)}')
 
     # Calculate budget for variable content (summary, benefit, how_to)
     static_len = len(clean_title) + len(clean_vendor) + len(clean_product) + 200
@@ -91,12 +97,12 @@ def render_high_priority_message(event: dict, enrichment: dict) -> str:
     for l in link_lines:
         static_len += len(l) + 10
 
-    available_budget = max(400, MAX_MESSAGE_CHARS - static_len)
+    available_budget = max(300, MAX_MESSAGE_CHARS - static_len)
 
-    how_budget = min(400, len(uz_how)) if uz_how else 0
+    how_budget = min(300, len(uz_how)) if uz_how else 0
     remaining = available_budget - how_budget
-    benefit_budget = min(600, max(150, remaining // 3))
-    summary_budget = max(200, remaining - benefit_budget)
+    benefit_budget = min(500, max(120, remaining // 3))
+    summary_budget = max(180, remaining - benefit_budget)
 
     clean_summary = truncate_field(uz_summary, summary_budget)
     clean_benefit = truncate_field(uz_benefit, benefit_budget)
@@ -138,15 +144,22 @@ def render_high_priority_message(event: dict, enrichment: dict) -> str:
     # If escaped tags / entities push length over limit, iteratively truncate field text BEFORE escaping
     while len(full_text) > MAX_MESSAGE_CHARS:
         excess = len(full_text) - MAX_MESSAGE_CHARS
-        if len(clean_summary) > 200:
-            reduction = min(len(clean_summary) - 150, excess + 20)
+        if len(clean_summary) > 100:
+            reduction = min(len(clean_summary) - 80, excess + 20)
             clean_summary = truncate_field(clean_summary, len(clean_summary) - reduction)
-        elif len(clean_benefit) > 100:
-            reduction = min(len(clean_benefit) - 80, excess + 20)
+        elif len(clean_benefit) > 60:
+            reduction = min(len(clean_benefit) - 50, excess + 20)
             clean_benefit = truncate_field(clean_benefit, len(clean_benefit) - reduction)
-        elif clean_how and len(clean_how) > 50:
-            reduction = min(len(clean_how) - 40, excess + 20)
+        elif clean_how and len(clean_how) > 40:
+            reduction = min(len(clean_how) - 30, excess + 20)
             clean_how = truncate_field(clean_how, len(clean_how) - reduction)
+        elif len(clean_title) > 50:
+            reduction = min(len(clean_title) - 40, excess + 20)
+            clean_title = truncate_field(clean_title, len(clean_title) - reduction)
+        elif len(link_lines) > 1:
+            link_lines.pop()
+        elif warnings:
+            warnings.pop()
         else:
             break
         full_text = _build_message(clean_title, clean_summary, clean_benefit, clean_how)
@@ -154,10 +167,11 @@ def render_high_priority_message(event: dict, enrichment: dict) -> str:
     return full_text
 
 
-def render_merged_high_priority(items: list[tuple[dict, dict]]) -> list[str]:
+def render_merged_pages(items: list[tuple[dict, dict]]) -> list[tuple[str, list[tuple[dict, dict]]]]:
     """Consolidate multiple high-priority updates when soft cap (5/day) is exceeded.
 
     Splits into several bounded messages (<= 3900 chars) ensuring every event is contained.
+    Returns a list of tuples: (rendered_message, list_of_items_in_this_page).
     """
     if not items:
         return []
@@ -165,82 +179,138 @@ def render_merged_high_priority(items: list[tuple[dict, dict]]) -> list[str]:
     header = "🔔 <b>Vendor Updates — Yuqori Muhimlikdagi Yangilanishlar (Birlashtirilgan)</b>\n" \
              "Bugungi muhim yangilanishlar hajmi ko'pligi sababli birlashtirildi.\n\n"
 
-    messages: list[str] = []
+    pages: list[tuple[str, list[tuple[dict, dict]]]] = []
     current_parts = [header]
+    current_items: list[tuple[dict, dict]] = []
     current_len = len(header)
 
     for idx, (event, enrichment) in enumerate(items, 1):
-        vendor = truncate_field(event.get("vendor", ""), 60)
-        product = truncate_field(event.get("product", ""), 60)
+        vendor = truncate_field(event.get("vendor", ""), 50)
+        product = truncate_field(event.get("product", ""), 50)
         raw_title = enrichment.get("uz_title") or event.get("title", "")
-        title = truncate_field(raw_title, 150)
-        summary = truncate_field(enrichment.get("uz_summary", ""), 300)
-        benefit = truncate_field(enrichment.get("uz_benefit", ""), 200)
+        title = truncate_field(raw_title, 120)
+        summary = truncate_field(enrichment.get("uz_summary", ""), 250)
+        benefit = truncate_field(enrichment.get("uz_benefit", ""), 150)
         link = event.get("link", "")
 
-        block_parts = [
-            f"<b>{idx}. {html.escape(vendor)} — {html.escape(product)}: {html.escape(title)}</b>",
-            f"📌 <b>Nima:</b> {html.escape(summary)}",
-            f"🎯 <b>Foydasi:</b> {html.escape(benefit)}",
-        ]
-        if link:
-            block_parts.append(f"🔗 <b>Manba:</b> <a href=\"{html.escape(link)}\">{html.escape(link)}</a>")
-        block_parts.append("")
+        def _build_block(t_txt: str, s_txt: str, b_txt: str) -> str:
+            parts = [
+                f"<b>{idx}. {html.escape(vendor)} — {html.escape(product)}: {html.escape(t_txt)}</b>",
+                f"📌 <b>Nima:</b> {html.escape(s_txt)}",
+                f"🎯 <b>Foydasi:</b> {html.escape(b_txt)}",
+            ]
+            if link:
+                cl = link.strip()
+                esc_cl = html.escape(cl)
+                if len(esc_cl) <= 250 and len(cl) <= 200:
+                    short_lbl = truncate_field(cl, 80)
+                    parts.append(f'🔗 <b>Manba:</b> <a href="{esc_cl}">{html.escape(short_lbl)}</a>')
+                else:
+                    short_lbl = truncate_field(cl, 80)
+                    parts.append(f'🔗 <b>Manba:</b> {html.escape(short_lbl)}')
+            parts.append("")
+            return "\n".join(parts) + "\n"
 
-        block = "\n".join(block_parts) + "\n"
+        block = _build_block(title, summary, benefit)
+        while len(block) > 900:
+            if len(summary) > 80:
+                summary = truncate_field(summary, len(summary) - 40)
+            elif len(benefit) > 60:
+                benefit = truncate_field(benefit, len(benefit) - 30)
+            elif len(title) > 50:
+                title = truncate_field(title, len(title) - 20)
+            else:
+                break
+            block = _build_block(title, summary, benefit)
 
+        cont_header = "🔔 <b>Vendor Updates — Birlashtirilgan yangilanishlar (davomi)</b>\n\n"
         if current_len + len(block) > (MAX_MESSAGE_CHARS - 50):
-            messages.append("\n".join(current_parts).strip())
-            cont_header = "🔔 <b>Vendor Updates — Birlashtirilgan yangilanishlar (davomi)</b>\n\n"
+            if current_items:
+                pages.append(("\n".join(current_parts).strip(), current_items))
             current_parts = [cont_header, block]
+            current_items = [(event, enrichment)]
             current_len = len(cont_header) + len(block)
         else:
             current_parts.append(block)
+            current_items.append((event, enrichment))
             current_len += len(block)
 
-    if current_parts:
-        messages.append("\n".join(current_parts).strip())
+    if current_items:
+        pages.append(("\n".join(current_parts).strip(), current_items))
 
-    return messages
+    return [(m, itms) for m, itms in pages if m.strip()]
 
 
-def render_digest_messages(items: list[tuple[dict, dict]]) -> list[str]:
-    """Render regular updates (SDK patches, minor features) into one or more digest messages <= 3900 chars."""
+def render_merged_high_priority(items: list[tuple[dict, dict]]) -> list[str]:
+    return [page[0] for page in render_merged_pages(items)]
+
+
+def render_digest_pages(items: list[tuple[dict, dict]]) -> list[tuple[str, list[tuple[dict, dict]]]]:
+    """Render regular updates into one or more digest messages <= 3900 chars.
+
+    Returns a list of tuples: (rendered_message, list_of_items_in_this_page).
+    """
     if not items:
         return []
 
     header = "📋 <b>Vendor Updates — Kunlik Dayjest</b>\n" \
              "So'nggi tizimli yangilanishlar va kutubxona relizlari:\n\n"
 
-    messages: list[str] = []
+    pages: list[tuple[str, list[tuple[dict, dict]]]] = []
     current_parts = [header]
+    current_items: list[tuple[dict, dict]] = []
     current_len = len(header)
 
     for idx, (event, enrichment) in enumerate(items, 1):
-        vendor = event.get("vendor", "")
-        product = event.get("product", "")
-        title = enrichment.get("uz_title") or event.get("title", "")
-        summary = enrichment.get("uz_summary", "")
-        if len(summary) > 300:
-            summary = summary[:297] + "..."
+        vendor = truncate_field(event.get("vendor", ""), 50)
+        product = truncate_field(event.get("product", ""), 50)
+        raw_title = enrichment.get("uz_title") or event.get("title", "")
+        title = truncate_field(raw_title, 120)
+        raw_summary = enrichment.get("uz_summary", "")
+        summary = truncate_field(raw_summary, 250)
         links = event.get("links") or ([event.get("link")] if event.get("link") else [])
-        primary_link = links[0] if links else ""
+        primary_link = links[0].strip() if links and links[0] else ""
 
-        block = f"🔹 <b>{idx}. {html.escape(vendor)} ({html.escape(product)})</b>: {html.escape(title)}\n" \
-                f"   • {html.escape(summary)}\n"
-        if primary_link:
-            block += f"   • <a href=\"{html.escape(primary_link)}\">Havola</a>\n"
-        block += "\n"
+        def _build_block(t_txt: str, s_txt: str) -> str:
+            b = f"🔹 <b>{idx}. {html.escape(vendor)} ({html.escape(product)})</b>: {html.escape(t_txt)}\n" \
+                f"   • {html.escape(s_txt)}\n"
+            if primary_link:
+                esc_link = html.escape(primary_link)
+                if len(esc_link) <= 250 and len(primary_link) <= 200:
+                    b += f'   • <a href="{esc_link}">Havola</a>\n'
+                else:
+                    short_lbl = truncate_field(primary_link, 80)
+                    b += f'   • Havola: {html.escape(short_lbl)}\n'
+            b += "\n"
+            return b
 
+        block = _build_block(title, summary)
+        while len(block) > 800:
+            if len(summary) > 80:
+                summary = truncate_field(summary, len(summary) - 40)
+            elif len(title) > 50:
+                title = truncate_field(title, len(title) - 20)
+            else:
+                break
+            block = _build_block(title, summary)
+
+        cont_header = "📋 <b>Vendor Updates — Dayjest (davomi)</b>\n\n"
         if current_len + len(block) > (MAX_MESSAGE_CHARS - 50):
-            messages.append(truncate_lines("".join(current_parts).strip(), MAX_MESSAGE_CHARS))
-            current_parts = [f"📋 <b>Vendor Updates — Dayjest (davomi)</b>\n\n", block]
-            current_len = len(current_parts[0]) + len(block)
+            if current_items:
+                pages.append(("".join(current_parts).strip(), current_items))
+            current_parts = [cont_header, block]
+            current_items = [(event, enrichment)]
+            current_len = len(cont_header) + len(block)
         else:
             current_parts.append(block)
+            current_items.append((event, enrichment))
             current_len += len(block)
 
-    if current_parts:
-        messages.append(truncate_lines("".join(current_parts).strip(), MAX_MESSAGE_CHARS))
+    if current_items:
+        pages.append(("".join(current_parts).strip(), current_items))
 
-    return messages
+    return [(m, itms) for m, itms in pages if m.strip()]
+
+
+def render_digest_messages(items: list[tuple[dict, dict]]) -> list[str]:
+    return [page[0] for page in render_digest_pages(items)]

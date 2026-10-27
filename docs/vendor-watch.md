@@ -9,9 +9,11 @@ Asosiy imkoniyatlari:
 - **LLM tahlili va O'zbekcha hisobot:** Vertex AI Gemini orqali relizning foydalanuvchi stekiga (`profile.md`) aniq foydasini, qanday ishlatilishini va cheklovlarini ajratib, o'zbek tilida tayyorlaydi. LLM xato bersa ham "raw mode" orqali yetkazib berish uzilmaydi.
 - **Telegram yetkazish va Outbox:** Tranzaksion outbox va `processing_jobs` orqali xabarlarni xavfsiz saqlaydi. Yuqori muhimlikdagi xabarlar darhol (kuniga 5 tagacha soft-cap, oshsa har biri to'liq qamrab olingan holda bo'lib yuboriladi), SDK patch'lari esa kunlik dayjest ko'rinishida yuboriladi.
 - **Kunlik dayjest avtomatik flush:** `last_digest_date` holati orqali har 6 soatda ishga tushuvchi oddiy `--once` tsikllarida ham kuniga bir marta avtomatik yuboriladi (alohida `--digest` bayrog'i talab etilmaydi).
-- **Xavfsiz Dry-run semantikasi:** `--dry-run` bayrog'i persistent bazani (diskdagi SQLite faylini) o'zgartirmaydi, in-memory nusxada ishlaydi. Real outbox holati va pending xabarlar buzilmaydi.
-- **Pre-reliz shovqinidan tozalash:** `-alpha`, `-beta`, `-rc` versiyalar shovqin deb hisoblanadi va dayjestdan ham, darhol xabarlardan ham chiqarib tashlanadi (agar xavfsizlik yoki breaking change bo'lmasa).
-- **Qabul qiluvchilar bo'yicha mustaqil kuzatuv:** Bir necha chat_id bo'lganda, ularning har biriga yetkazish alohida kuzatiladi va xato yuz berganda faqat bormagan chatlarga qayta urinish qilinadi.
+- **Xavfsiz Dry-run semantikasi:** `--dry-run` bayrog'i persistent bazani (diskdagi SQLite faylini) o'zgartirmaydi, in-memory nusxada ishlaydi. Hatto eski (commit 2401697) bazalarda ham fayl strukturasi yoki sxemasi diskda o'zgartirilmaydi.
+- **Avariyadan tiklanish (Crash Recovery):** Tizim to'xtab qayta ishga tushganda navbatdagi hodisaning eng so'nggi reviziyasini oladi, maksimal xavfsizlik darajasini (severity) saqlab qoladi va oldin yuborilgan qabul qiluvchilarga qayta yubormaydi.
+- **Klaster a'zolari va Dayjest xotirasi:** Birlashgan va dayjestga tushgan barcha manba hodisalari alohida (`event_notifications`) qayd etiladi, bu keyingi tsikllarda takroriy xabarnomalar chiqishini to'liq oldini oladi.
+- **Pre-reliz shovqinidan tozalash:** `-alpha`, `-beta`, `-rc` versiyalar reliz sarlavhasi yoki tegi bo'yicha aniqlanadi (tana matnidagi ma'lumotlar adashtirmaydi) va dayjestdan ham, darhol xabarlardan ham chiqarib tashlanadi (agar xavfsizlik bo'lmasa).
+- **Qabul qiluvchilar bo'yicha mustaqil kuzatuv:** Bir necha chat_id bo'lganda, ularning har biriga yetkazish alohida kuzatiladi va xato yuz berganda faqat hozirgi konfiguratsiyada mavjud bo'lgan kutilayotgan chatlarga qayta urinish qilinadi.
 
 ---
 

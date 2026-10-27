@@ -96,16 +96,26 @@ SEVERITY_ORDER = {
 }
 
 
-def is_prerelease(title: str, text: str = "") -> bool:
-    """Check if title or text indicates an alpha/beta/rc/preview pre-release."""
-    full = f"{title} {text}".lower()
-    if any(k in full for k in _PRERELEASE_KEYWORDS):
+def is_prerelease(
+    title: str,
+    text: str = "",
+    entry_id: str = "",
+    is_prerelease_flag: bool = False,
+) -> bool:
+    """Check if title, tag or GitHub flag indicates an alpha/beta/rc/preview pre-release.
+
+    Decide prerelease from tag, title, or GitHub prerelease flag, never from body text.
+    """
+    if is_prerelease_flag:
         return True
-    match = _SEMVER_RE.search(title) or _SEMVER_RE.search(text)
+    target = f"{title} {entry_id}".lower()
+    match = _SEMVER_RE.search(title) or _SEMVER_RE.search(entry_id)
     if match and match.group(4):
         tag = match.group(4).lower()
         if any(w in tag for w in ("alpha", "beta", "rc", "preview", "canary", "dev")):
             return True
+    if any(k in target for k in ("-alpha", "-beta", "-rc", ".alpha", ".beta", ".rc")):
+        return True
     return False
 
 
@@ -126,12 +136,29 @@ def classify_event(event: dict) -> tuple[str, str]:
     Priority: high vs digest
     """
     title = (event.get("title") or "").lower()
+    entry_id = (event.get("entry_id") or "").lower()
     raw = (event.get("raw_content") or event.get("summary") or "").lower()
     full_text = f"{title}\n{raw}"
     product = (event.get("product") or "").lower()
     source_id = (event.get("source_id") or "").lower()
 
-    # 1. Deprecation / shutdown -> always high
+    # Pre-releases are determined from title, entry_id, or GitHub prerelease flag (never from body text)
+    prerelease_flag = (
+        event.get("prerelease") is True
+        or is_prerelease(
+            title,
+            entry_id=entry_id,
+            is_prerelease_flag=bool(event.get("prerelease")),
+        )
+    )
+
+    # Pre-releases are noise unless security fixes / vulnerabilities
+    if prerelease_flag:
+        if any(k in full_text for k in _SECURITY_KEYWORDS):
+            return "security", "high"
+        return "prerelease", "ignore"
+
+    # 1. Deprecation / shutdown -> always high for stable releases
     if any(k in full_text for k in _DEPRECATION_KEYWORDS):
         return "deprecation", "high"
 
@@ -149,7 +176,6 @@ def classify_event(event: dict) -> tuple[str, str]:
     ):
         is_breaking_kw = any(k in full_text for k in _BREAKING_KEYWORDS)
     semver = extract_semver(title) or extract_semver(raw)
-    prerelease_flag = is_prerelease(title, raw) or (event.get("prerelease") is True)
 
     if is_breaking_kw:
         return "breaking", "high"
@@ -260,6 +286,8 @@ def cluster_duplicates(events: list[dict]) -> list[dict]:
             ev = cluster[0]
             if "links" not in ev:
                 ev["links"] = [ev["link"]] if ev.get("link") else []
+            if "member_ids" not in ev and ev.get("id"):
+                ev["member_ids"] = [ev["id"]]
             merged_events.append(ev)
         else:
             # Merge cluster: keep all member content and the maximum severity
@@ -267,9 +295,11 @@ def cluster_duplicates(events: list[dict]) -> list[dict]:
             all_links = []
             all_products = []
             all_contents = []
-            max_severity = -1
             best_type = primary.get("triage_type") or "other"
             best_prio = primary.get("priority") or "digest"
+            if not primary.get("triage_type") or not primary.get("priority"):
+                best_type, best_prio = classify_event(primary)
+            max_severity = SEVERITY_ORDER.get(best_type, 10)
 
             for item in cluster:
                 link = item.get("link")
@@ -298,6 +328,7 @@ def cluster_duplicates(events: list[dict]) -> list[dict]:
                     best_prio = iprio
 
             merged = dict(primary)
+            merged["member_ids"] = [item["id"] for item in cluster if item.get("id")]
             merged["links"] = all_links
             merged["clustered_sources"] = all_products
             merged["cluster_count"] = len(cluster)

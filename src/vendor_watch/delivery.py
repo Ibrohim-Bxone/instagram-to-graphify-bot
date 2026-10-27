@@ -93,8 +93,14 @@ def deliver(
         from . import store
         store.init_outbox_deliveries(conn, outbox_id, chat_ids)
         pending_cids = store.get_pending_delivery_chat_ids(conn, outbox_id)
+        # N4: Retry only recipients that are both pending and currently configured
+        configured_set = set(chat_ids)
+        pending_cids = [cid for cid in pending_cids if cid in configured_set]
     else:
         pending_cids = chat_ids
+
+    if not pending_cids:
+        return True, ""
 
     errors = []
     for cid in pending_cids:

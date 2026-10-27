@@ -19,6 +19,18 @@ def load_sources() -> list[dict]:
     return json.loads(sources_path.read_text(encoding="utf-8"))
 
 
+def _mark_all_done(conn: sqlite3.Connection, ev: dict) -> None:
+    member_ids = ev.get("member_ids") or [ev["id"]]
+    for mid in member_ids:
+        store.mark_processing_job_done(conn, mid)
+
+
+def _mark_all_notified(conn: sqlite3.Connection, ev: dict, status: str = "sent") -> None:
+    member_ids = ev.get("member_ids") or [ev["id"]]
+    for mid in member_ids:
+        store.mark_event_notified(conn, mid, status)
+
+
 def run_cycle(
     db_path: Path | str,
     fixtures: bool = False,
@@ -31,11 +43,17 @@ def run_cycle(
     if dry_run:
         # Dry-run must not mutate persistent state. Work on an in-memory copy.
         if str(db_path) != ":memory:" and Path(db_path).is_file():
-            disk_conn = store.get_connection(db_path)
+            try:
+                disk_conn = sqlite3.connect(
+                    f"file:{Path(db_path).resolve().as_posix()}?mode=ro", uri=True
+                )
+            except Exception:
+                disk_conn = sqlite3.connect(str(db_path))
             conn = sqlite3.connect(":memory:")
             conn.row_factory = sqlite3.Row
             disk_conn.backup(conn)
             disk_conn.close()
+            store._init_schema(conn)
         else:
             conn = store.get_connection(":memory:")
     else:
@@ -159,12 +177,34 @@ def run_cycle(
         baseline_digest_items = store.get_recent_baseline_entries(conn, days=7)
 
     # 3. Combine newly discovered events with resumed unfinished jobs
-    events_to_process = list(unfinished_jobs)
-    seen_ids = {e["id"] for e in events_to_process}
+    events_by_id: dict[str, dict] = {}
+    for uj in unfinished_jobs:
+        u_type, u_prio = triage.classify_event(uj)
+        uj["triage_type"] = u_type
+        uj["priority"] = u_prio
+        events_by_id[uj["id"]] = uj
+
     for ne in new_events:
-        if ne["id"] not in seen_ids:
-            events_to_process.append(ne)
-            seen_ids.add(ne["id"])
+        nid = ne["id"]
+        n_type, n_prio = triage.classify_event(ne)
+        ne["triage_type"] = n_type
+        ne["priority"] = n_prio
+
+        if nid not in events_by_id:
+            events_by_id[nid] = ne
+        else:
+            existing = events_by_id[nid]
+            latest = ne if ne.get("revision", 1) >= existing.get("revision", 1) else existing
+            e_rank = triage.SEVERITY_ORDER.get(existing.get("triage_type"), 10)
+            n_rank = triage.SEVERITY_ORDER.get(ne.get("triage_type"), 10)
+            best_type = ne.get("triage_type") if n_rank >= e_rank else existing.get("triage_type")
+            best_prio = ne.get("priority") if n_rank >= e_rank else existing.get("priority")
+            merged_item = dict(latest)
+            merged_item["triage_type"] = best_type
+            merged_item["priority"] = best_prio
+            events_by_id[nid] = merged_item
+
+    events_to_process = list(events_by_id.values())
 
     # Cluster duplicates across sources within 24h
     clustered = triage.cluster_duplicates(events_to_process)
@@ -175,9 +215,19 @@ def run_cycle(
         ev_vendor = (ev.get("vendor") or "").strip().lower()
         ev_key = triage._extract_entity_key(ev.get("title", ""), ev.get("raw_content", ""), ev.get("product", ""))
         ev_t = triage._parse_time(ev.get("published_at", ""))
-        t_type, prio = triage.classify_event(ev)
-        ev["triage_type"] = t_type
-        ev["priority"] = prio
+
+        t_type = ev.get("triage_type")
+        prio = ev.get("priority")
+        if not t_type or not prio:
+            t_type, prio = triage.classify_event(ev)
+            ev["triage_type"] = t_type
+            ev["priority"] = prio
+        else:
+            c_type, c_prio = triage.classify_event(ev)
+            if triage.SEVERITY_ORDER.get(c_type, 10) > triage.SEVERITY_ORDER.get(t_type, 10):
+                ev["triage_type"] = c_type
+                ev["priority"] = c_prio
+                t_type, prio = c_type, c_prio
 
         # Compare with persisted clusters from last 24h
         already_notified = False
@@ -189,7 +239,9 @@ def run_cycle(
             p_t = triage._parse_time(p_ev.get("published_at", ""))
             if ev_vendor == p_vendor and ev_key and ev_key == p_key and abs(ev_t - p_t) <= 86400:
                 if p_ev.get("outbox_status") in ("sent", "pending"):
-                    p_type, _ = triage.classify_event(p_ev)
+                    p_type = p_ev.get("triage_type")
+                    if not p_type:
+                        p_type, _ = triage.classify_event(p_ev)
                     ev_rank = triage.SEVERITY_ORDER.get(t_type, 10)
                     p_rank = triage.SEVERITY_ORDER.get(p_type, 10)
                     if ev_rank <= p_rank:
@@ -197,7 +249,7 @@ def run_cycle(
                         break
 
         if already_notified:
-            store.mark_processing_job_done(conn, ev["id"])
+            _mark_all_done(conn, ev)
             continue
 
         filtered_events.append(ev)
@@ -216,7 +268,7 @@ def run_cycle(
 
         # Pre-releases with priority 'ignore' are noise (excluded from digest and immediate)
         if prio == "ignore" or t_type == "prerelease":
-            store.mark_processing_job_done(conn, ev["id"])
+            _mark_all_done(conn, ev)
             continue
 
         enrichment = enricher.enrich_event(
@@ -243,20 +295,49 @@ def run_cycle(
             overflow_items.append(item)
 
     for ev, enr in immediate_items:
+        rev = ev.get("revision", 1)
+        existing_out = store.get_outbox_for_event(conn, ev["id"], revision=rev)
+        if existing_out and existing_out["status"] == "sent":
+            _mark_all_notified(conn, ev, "sent")
+            _mark_all_done(conn, ev)
+            continue
+
         msg = renderer.render_high_priority_message(ev, enr)
-        out_id = store.add_to_outbox(conn, ev["id"], "high", msg)
+        if existing_out:
+            out_id = existing_out["id"]
+        else:
+            out_id = store.add_to_outbox(conn, ev["id"], "high", msg, revision=rev)
+            store.link_outbox_events(conn, out_id, [ev])
+
         success, err = delivery.deliver(msg, dry_run=dry_run, conn=conn, outbox_id=out_id)
         store.update_outbox_status(conn, out_id, "sent" if success else "failed", err)
-        store.mark_processing_job_done(conn, ev["id"])
+        _mark_all_notified(conn, ev, "sent" if success else "failed")
+        _mark_all_done(conn, ev)
 
     if overflow_items:
-        merged_msgs = renderer.render_merged_high_priority(overflow_items)
-        for m_msg in merged_msgs:
-            out_id = store.add_to_outbox(conn, "merged_high", "high", m_msg)
+        merged_pages = renderer.render_merged_pages(overflow_items)
+        for m_msg, page_items in merged_pages:
+            page_events = [it[0] for it in page_items]
+            existing_out = store.find_existing_outbox_for_events(conn, page_events)
+            if existing_out and existing_out["status"] == "sent":
+                for p_ev in page_events:
+                    _mark_all_notified(conn, p_ev, "sent")
+                    _mark_all_done(conn, p_ev)
+                continue
+
+            if existing_out:
+                out_id = existing_out["id"]
+            else:
+                out_id = store.add_to_outbox(conn, "merged_high", "high", m_msg)
+                store.link_outbox_events(conn, out_id, page_events)
+                for p_ev in page_events:
+                    _mark_all_notified(conn, p_ev, "pending")
+
             success, err = delivery.deliver(m_msg, dry_run=dry_run, conn=conn, outbox_id=out_id)
             store.update_outbox_status(conn, out_id, "sent" if success else "failed", err)
-        for o_ev, _ in overflow_items:
-            store.mark_processing_job_done(conn, o_ev["id"])
+            for p_ev in page_events:
+                _mark_all_notified(conn, p_ev, "sent" if success else "failed")
+                _mark_all_done(conn, p_ev)
 
     # 6. Process digest (daily or --digest or --fixtures or --baseline-digest)
     should_send_digest = digest_mode or is_daily_due or (fixtures and digest_items) or (baseline_digest and baseline_digest_items)
@@ -265,26 +346,52 @@ def run_cycle(
         all_for_digest = list(digest_items)
         if baseline_digest and baseline_digest_items:
             for b_ev in baseline_digest_items:
+                b_type, b_prio = triage.classify_event(b_ev)
+                if b_prio == "ignore" or b_type == "prerelease":
+                    continue
+                b_ev["triage_type"] = b_type
+                b_ev["priority"] = b_prio
                 b_enr = enricher.enrich_event(b_ev, profile_text=profile_text, use_stub=fixtures)
                 all_for_digest.append((b_ev, b_enr))
 
         if all_for_digest:
-            digest_msgs = renderer.render_digest_messages(all_for_digest)
-            for d_msg in digest_msgs:
-                out_id = store.add_to_outbox(conn, "digest", "digest", d_msg)
+            digest_pages = renderer.render_digest_pages(all_for_digest)
+            for d_msg, page_items in digest_pages:
+                page_events = [it[0] for it in page_items]
+                existing_out = store.find_existing_outbox_for_events(conn, page_events)
+                if existing_out and existing_out["status"] == "sent":
+                    for p_ev in page_events:
+                        _mark_all_notified(conn, p_ev, "sent")
+                        _mark_all_done(conn, p_ev)
+                    continue
+
+                if existing_out:
+                    out_id = existing_out["id"]
+                else:
+                    out_id = store.add_to_outbox(conn, "digest", "digest", d_msg)
+                    store.link_outbox_events(conn, out_id, page_events)
+                    for p_ev in page_events:
+                        _mark_all_notified(conn, p_ev, "pending")
+
                 success, err = delivery.deliver(d_msg, dry_run=dry_run, conn=conn, outbox_id=out_id)
                 store.update_outbox_status(conn, out_id, "sent" if success else "failed", err)
-            for d_ev, _ in digest_items:
-                store.mark_processing_job_done(conn, d_ev["id"])
+                for p_ev in page_events:
+                    _mark_all_notified(conn, p_ev, "sent" if success else "failed")
+                    _mark_all_done(conn, p_ev)
 
         if not dry_run and (is_daily_due or digest_mode):
             store.set_app_state(conn, "last_digest_date", today_str)
     elif digest_items:
-        digest_msgs = renderer.render_digest_messages(digest_items)
-        for d_msg in digest_msgs:
-            store.add_to_outbox(conn, "digest", "digest", d_msg)
-        for d_ev, _ in digest_items:
-            store.mark_processing_job_done(conn, d_ev["id"])
+        digest_pages = renderer.render_digest_pages(digest_items)
+        for d_msg, page_items in digest_pages:
+            page_events = [it[0] for it in page_items]
+            existing_out = store.find_existing_outbox_for_events(conn, page_events)
+            if not existing_out:
+                out_id = store.add_to_outbox(conn, "digest", "digest", d_msg)
+                store.link_outbox_events(conn, out_id, page_events)
+            for p_ev in page_events:
+                _mark_all_notified(conn, p_ev, "pending")
+                _mark_all_done(conn, p_ev)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

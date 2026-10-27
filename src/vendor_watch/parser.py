@@ -21,6 +21,7 @@ class FeedEntry:
     published_at: str
     summary: str
     raw_content: str
+    legacy_raw_content: str = ""
 
 
 def strip_html(text: str) -> str:
@@ -86,6 +87,9 @@ def parse_feed(content: str | bytes) -> list[FeedEntry]:
             published = ""
             summary = ""
             content_val = ""
+            raw_summary = ""
+            raw_content = ""
+            legacy_content_val = ""
 
             for prop in child:
                 ptag = _clean_tag(prop)
@@ -105,14 +109,20 @@ def parse_feed(content: str | bytes) -> list[FeedEntry]:
                 elif ptag in ("updated", "published") and not published:
                     published = parse_date(ptext)
                 elif ptag == "summary" and not summary:
+                    raw_summary = ptext
                     summary = strip_html(ptext)
+                    if not legacy_content_val:
+                        legacy_content_val = ptext
                 elif ptag == "content" and not content_val:
+                    raw_content = ptext
                     content_val = ptext
+                    if not legacy_content_val:
+                        legacy_content_val = ptext
 
-            if not content_val and summary:
-                content_val = summary
-            if not summary and content_val:
-                summary = strip_html(content_val)
+            final_content = raw_content or raw_summary or summary
+            legacy_final = legacy_content_val or raw_summary or raw_content or summary
+            if not summary and final_content:
+                summary = strip_html(final_content)
 
             if not entry_id:
                 entry_id = link or title
@@ -124,7 +134,8 @@ def parse_feed(content: str | bytes) -> list[FeedEntry]:
                     link=link,
                     published_at=published or datetime.now().isoformat(),
                     summary=summary,
-                    raw_content=content_val or summary,
+                    raw_content=final_content,
+                    legacy_raw_content=legacy_final,
                 ))
 
     elif root_tag in ("rss", "rdf") or any(_clean_tag(c) == "channel" for c in root):
@@ -145,6 +156,9 @@ def parse_feed(content: str | bytes) -> list[FeedEntry]:
             pub_date = ""
             description = ""
             encoded_content = ""
+            raw_desc = ""
+            raw_encoded = ""
+            legacy_encoded = ""
 
             for prop in child:
                 ptag = _clean_tag(prop)
@@ -158,14 +172,20 @@ def parse_feed(content: str | bytes) -> list[FeedEntry]:
                 elif ptag in ("pubdate", "date") and not pub_date:
                     pub_date = parse_date(ptext)
                 elif ptag == "description" and not description:
+                    raw_desc = ptext
                     description = strip_html(ptext)
+                    if not legacy_encoded:
+                        legacy_encoded = ptext
                 elif ptag in ("encoded", "content") and not encoded_content:
+                    raw_encoded = ptext
                     encoded_content = ptext
+                    if not legacy_encoded:
+                        legacy_encoded = ptext
 
-            if not encoded_content and description:
-                encoded_content = description
-            if not description and encoded_content:
-                description = strip_html(encoded_content)
+            final_content = raw_encoded or raw_desc or description
+            legacy_final = legacy_encoded or raw_desc or raw_encoded or description
+            if not description and final_content:
+                description = strip_html(final_content)
 
             entry_id = guid or link or title
             if entry_id or title:
@@ -175,7 +195,8 @@ def parse_feed(content: str | bytes) -> list[FeedEntry]:
                     link=link,
                     published_at=pub_date or datetime.now().isoformat(),
                     summary=description,
-                    raw_content=encoded_content or description,
+                    raw_content=final_content,
+                    legacy_raw_content=legacy_final,
                 ))
     else:
         raise FeedParseError(f"Noma'lum feed turi: root tag <{root_tag}>")

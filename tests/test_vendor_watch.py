@@ -824,3 +824,850 @@ def test_db_schema_migration_from_2401697(tmp_path: Path):
 
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox_deliveries'")
     assert cur.fetchone() is not None
+
+
+def test_regression_p1_crash_recovery_latest_revision_and_highest_severity(tmp_path: Path, monkeypatch):
+    """P1: Resumed crash-recovery processes the LATEST revision of an event and preserves the highest severity."""
+    from src.vendor_watch import runner
+    db_path = tmp_path / "test.db"
+    conn = store.get_connection(db_path)
+
+    # Ingestion: revision 1 pending
+    source = {"id": "src-p1", "vendor": "Anthropic", "product": "Claude Code"}
+    ev_rev1 = parser.FeedEntry(
+        entry_id="v1.0.0",
+        title="Claude Code v1.0.0",
+        link="https://github.com/anthropics/claude-code/releases/tag/v1.0.0",
+        published_at="2026-10-28T00:00:00Z",
+        summary="Minor patch fixes",
+        raw_content="Routine bug fixes with no security issues.",
+    )
+    store.record_unseen_entries(conn, source, [ev_rev1])
+
+    # Pending processing job exists for revision 1
+    jobs = store.get_pending_processing_jobs(conn)
+    assert len(jobs) == 1
+    assert jobs[0]["revision"] == 1
+
+    # Simulate fetch discovering revision 2 with critical security fix
+    mock_src = dict(source)
+    mock_src["url"] = "https://example.com/feed.atom"
+    monkeypatch.setattr(runner, "load_sources", lambda: [mock_src])
+
+    from src.vendor_watch import fetcher
+    mock_atom = """<?xml version="1.0" encoding="utf-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <entry>
+        <id>v1.0.0</id>
+        <title>Claude Code v1.0.0</title>
+        <link href="https://github.com/anthropics/claude-code/releases/tag/v1.0.0"/>
+        <summary>Security update</summary>
+        <content type="text">Critical security fix for CVE-2026-7777 vulnerability.</content>
+      </entry>
+    </feed>"""
+    monkeypatch.setattr(fetcher, "fetch_feed", lambda src, snapshot=None, fixtures_dir=None: fetcher.FetchResult(status=200, content=mock_atom.encode("utf-8")))
+
+    delivered = []
+    monkeypatch.setattr(delivery, "deliver", lambda text, dry_run=False, conn=None, outbox_id=None: (delivered.append(text) or True, ""))
+
+    runner.run_cycle(db_path=db_path, dry_run=False, once=True)
+
+    # Job is completed
+    assert len(store.get_pending_processing_jobs(conn)) == 0
+    # Immediate high priority notification was sent for the security fix
+    assert len(delivered) >= 1
+    assert any("CVE-2026-7777" in d or "Xavfsizlik" in d or "security" in d.lower() for d in delivered)
+
+
+def test_regression_p3_digest_rendering_does_not_truncate_html_with_huge_url():
+    """P3: Digest rendering with a 4,500-char URL does not truncate HTML mid-tag and keeps valid HTML <= 3900 chars."""
+    huge_url = "https://example.com/release/" + ("a" * 4500)
+    ev = {
+        "vendor": "Google",
+        "product": "Gemini CLI",
+        "title": "Gemini CLI v1.5.0",
+        "link": huge_url,
+        "links": [huge_url],
+    }
+    enr = {
+        "uz_title": "Gemini CLI v1.5.0 Yangilanishi",
+        "uz_summary": "Yangi qulayliklar qo'shildi va tizim barqarorligi oshirildi.",
+    }
+    msgs = renderer.render_digest_messages([(ev, enr)])
+    assert len(msgs) == 1
+    msg = msgs[0]
+    assert len(msg) <= 3900
+    assert not msg.endswith("<a href=\"")
+    assert "<a href=" not in msg or msg.count("<a href=") == msg.count("</a>")
+    assert "Havola:" in msg
+
+
+def test_regression_p4_merged_item_with_huge_url_bounded():
+    """P4: Merged high-priority item with a 4,500-char URL stays bounded <= 3900 chars with valid HTML."""
+    huge_url = "https://example.com/security-bulletin/" + ("x" * 4500)
+    ev = {
+        "vendor": "Anthropic",
+        "product": "Claude Code",
+        "title": "Claude Code Security Fix",
+        "link": huge_url,
+        "links": [huge_url],
+    }
+    enr = {
+        "uz_title": "Claude Code Xavfsizlik Tuzatishi",
+        "uz_summary": "Muhim xavfsizlik yangilanishi e'lon qilindi.",
+        "uz_benefit": "Tizim himoyasi ta'minlanadi.",
+    }
+    msgs = renderer.render_merged_high_priority([(ev, enr)])
+    assert len(msgs) == 1
+    msg = msgs[0]
+    assert len(msg) <= 3900
+    assert msg.count("<b>") == msg.count("</b>")
+    assert msg.count("<a href=") == msg.count("</a>")
+
+
+def test_regression_p5_runner_reclassification_preserves_merged_severity(tmp_path: Path, monkeypatch):
+    """P5: Runner re-classification does not discard merged severity (v1.2.3 + v1.2.3 security fix remains high)."""
+    from src.vendor_watch import runner
+    db_path = tmp_path / "test.db"
+    conn = store.get_connection(db_path)
+
+    ev_normal = parser.FeedEntry(
+        entry_id="v1.2.3",
+        title="Release v1.2.3",
+        link="https://example.com/v123",
+        published_at="2026-10-28T00:00:00Z",
+        summary="Minor maintenance release",
+        raw_content="General improvements.",
+    )
+    ev_security = parser.FeedEntry(
+        entry_id="v1.2.3-sec",
+        title="Release v1.2.3",
+        link="https://example.com/v123-sec",
+        published_at="2026-10-28T02:00:00Z",
+        summary="Security bulletin",
+        raw_content="Critical security fix for CVE-2026-5555 vulnerability.",
+    )
+    src = {"id": "src-p5", "vendor": "OpenAI", "product": "OpenAI Python SDK"}
+    store.record_unseen_entries(conn, src, [ev_normal, ev_security])
+
+    monkeypatch.setattr(runner, "load_sources", lambda: [])
+    delivered = []
+    monkeypatch.setattr(delivery, "deliver", lambda text, dry_run=False, conn=None, outbox_id=None: (delivered.append(text) or True, ""))
+
+    runner.run_cycle(db_path=db_path, dry_run=False, once=True)
+
+    # Merged cluster must be delivered immediately as high priority, not downgraded to digest
+    assert len(delivered) >= 1
+    assert any("CVE-2026-5555" in d or "Xavfsizlik" in d or "security" in d.lower() for d in delivered)
+
+
+def test_regression_p6_cross_run_dedup_for_digest_and_overflow_member_events(tmp_path: Path, monkeypatch):
+    """P6: Cross-run dedup recognizes digest member events as notified and prevents duplicate alerts."""
+    from src.vendor_watch import runner
+    db_path = tmp_path / "test.db"
+    conn = store.get_connection(db_path)
+
+    # Run 1: SDK patch delivered in digest
+    ev1 = parser.FeedEntry(
+        entry_id="v1.5.1",
+        title="Release v1.5.1",
+        link="https://example.com/v151",
+        published_at="2026-10-28T01:00:00Z",
+        summary="Patch release",
+        raw_content="Bug fix for connection retry.",
+    )
+    src1 = {"id": "src-feed-1", "vendor": "OpenAI", "product": "OpenAI Python SDK"}
+    store.record_unseen_entries(conn, src1, [ev1])
+
+    monkeypatch.setattr(runner, "load_sources", lambda: [])
+    delivered = []
+    monkeypatch.setattr(delivery, "deliver", lambda text, dry_run=False, conn=None, outbox_id=None: (delivered.append(text) or True, ""))
+
+    runner.run_cycle(db_path=db_path, dry_run=False, digest_mode=True, once=True)
+    assert len(delivered) == 1
+
+    # Run 2: Another source announces same v1.5.1 4 hours later
+    ev2 = parser.FeedEntry(
+        entry_id="news-v1.5.1",
+        title="OpenAI Python SDK v1.5.1",
+        link="https://example.com/news-v151",
+        published_at="2026-10-28T05:00:00Z",
+        summary="OpenAI Python SDK patch announcement",
+        raw_content="v1.5.1 is now released.",
+    )
+    src2 = {"id": "src-feed-2", "vendor": "OpenAI", "product": "OpenAI Python SDK"}
+    store.record_unseen_entries(conn, src2, [ev2])
+
+    delivered.clear()
+    runner.run_cycle(db_path=db_path, dry_run=False, digest_mode=True, once=True)
+
+    # Must be deduplicated against the earlier digest notification!
+    assert len(delivered) == 0
+
+
+def test_regression_p8_dry_run_on_legacy_2401697_db_does_not_modify_disk_file(tmp_path: Path, monkeypatch):
+    """P8: Dry-run on a legacy (commit 2401697) DB copies first and never creates tables on disk."""
+    import sqlite3
+    from src.vendor_watch import runner
+    db_file = tmp_path / "legacy_readonly.db"
+
+    conn = sqlite3.connect(str(db_file))
+    conn.executescript("""
+        CREATE TABLE sources_meta (
+            source_id TEXT PRIMARY KEY,
+            etag TEXT DEFAULT '',
+            last_modified TEXT DEFAULT '',
+            last_fetched_at TEXT DEFAULT '',
+            last_status INTEGER DEFAULT 0,
+            fail_count INTEGER DEFAULT 0,
+            is_baseline_done INTEGER DEFAULT 0
+        );
+        CREATE TABLE events (
+            id TEXT PRIMARY KEY,
+            source_id TEXT,
+            entry_id TEXT,
+            vendor TEXT,
+            product TEXT,
+            title TEXT,
+            link TEXT,
+            published_at TEXT,
+            content_hash TEXT,
+            revision INTEGER DEFAULT 1,
+            raw_content TEXT,
+            triage_type TEXT DEFAULT '',
+            priority TEXT DEFAULT '',
+            cluster_id TEXT DEFAULT '',
+            status TEXT DEFAULT 'unseen',
+            first_seen_at TEXT,
+            last_seen_at TEXT
+        );
+        CREATE TABLE outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT,
+            priority TEXT,
+            rendered_text TEXT,
+            status TEXT DEFAULT 'pending',
+            attempts INTEGER DEFAULT 0,
+            last_attempt_at TEXT DEFAULT '',
+            error_message TEXT DEFAULT '',
+            created_at TEXT
+        );
+        INSERT INTO events (id, title, content_hash) VALUES ('ev-1', 'Legacy Title', 'hash-1');
+    """)
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(runner, "load_sources", lambda: [])
+
+    # Execute with dry_run=True
+    runner.run_cycle(db_path=db_file, dry_run=True, once=True)
+
+    # Verify on-disk schema has NOT been altered: still exactly 3 tables
+    check_conn = sqlite3.connect(str(db_file))
+    cur = check_conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+    tables = [r[0] for r in cur.fetchall() if not r[0].startswith("sqlite_")]
+    check_conn.close()
+
+    assert sorted(tables) == ["events", "outbox", "sources_meta"]
+
+
+def test_regression_p11_prerelease_with_deprecation_is_not_immediate_and_filtered_from_baseline_digest(tmp_path: Path, monkeypatch):
+    """P11: v1.2.3-alpha.1 containing 'Deprecated' is classified as prerelease/ignore, and alpha entries are excluded from --baseline-digest."""
+    from src.vendor_watch import runner
+    # 1. Classification check
+    ev_alpha = {
+        "title": "Anthropic Claude Code v1.2.3-alpha.1",
+        "raw_content": "This experimental API is deprecated and will be removed in next alpha.",
+    }
+    t_type, prio = triage.classify_event(ev_alpha)
+    assert t_type == "prerelease"
+    assert prio == "ignore"
+
+    # 2. Baseline digest check
+    db_path = tmp_path / "test.db"
+    conn = store.get_connection(db_path)
+    entry_alpha = parser.FeedEntry(
+        entry_id="v1.2.3-alpha.1",
+        title="Anthropic Claude Code v1.2.3-alpha.1",
+        link="https://example.com/alpha1",
+        published_at="2026-10-28T00:00:00Z",
+        summary="Alpha preview",
+        raw_content="Deprecated endpoint inside alpha.",
+    )
+    src = {"id": "src-alpha", "vendor": "Anthropic", "product": "Claude Code"}
+    store.record_baseline(conn, src, [entry_alpha])
+
+    monkeypatch.setattr(runner, "load_sources", lambda: [])
+    delivered = []
+    monkeypatch.setattr(delivery, "deliver", lambda text, dry_run=False, conn=None, outbox_id=None: (delivered.append(text) or True, ""))
+
+    runner.run_cycle(db_path=db_path, dry_run=False, baseline_digest=True, once=True)
+
+    # Baseline digest must NOT contain alpha entry
+    assert len(delivered) == 0
+
+
+def test_regression_n1_crash_after_send_before_job_completion_skips_sent_recipients(tmp_path: Path, monkeypatch):
+    """N1: Crash after send but before job completion skips recipients already marked sent on restart."""
+    from src.vendor_watch import runner
+    db_path = tmp_path / "test.db"
+    conn = store.get_connection(db_path)
+
+    # Ingest event
+    entry = parser.FeedEntry(
+        entry_id="v2.0.0",
+        title="Codex CLI v2.0.0 Major",
+        link="https://example.com/v2",
+        published_at="2026-10-28T00:00:00Z",
+        summary="Breaking release",
+        raw_content="Breaking change details.",
+    )
+    src = {"id": "src-n1", "vendor": "OpenAI", "product": "Codex CLI"}
+    store.record_unseen_entries(conn, src, [entry])
+
+    monkeypatch.setenv("BOT_TOKEN", "mock-token")
+    monkeypatch.setattr(delivery, "get_target_chat_ids", lambda: ["chat-1", "chat-2"])
+    monkeypatch.setattr(runner, "load_sources", lambda: [])
+
+    sent_log = []
+    def mock_send(token, chat_id, text, timeout=15):
+        sent_log.append(chat_id)
+
+    monkeypatch.setattr(delivery, "send_to_telegram", mock_send)
+
+    # Simulate run that sends to both chats, marks deliveries sent in outbox, but crashes before mark_processing_job_done
+    out_id = store.add_to_outbox(conn, "src-n1:v2.0.0", "high", "Alert text")
+    delivery.deliver("Alert text", dry_run=False, conn=conn, outbox_id=out_id)
+    store.update_outbox_status(conn, out_id, "sent")
+    assert sent_log == ["chat-1", "chat-2"]
+    # Job remains pending (simulating crash before completion)
+    assert len(store.get_pending_processing_jobs(conn)) == 1
+
+    # Restart run_cycle
+    sent_log.clear()
+    runner.run_cycle(db_path=db_path, dry_run=False, once=True)
+
+    # Nothing should be re-sent to chat-1 or chat-2!
+    assert len(sent_log) == 0
+    # Job is now completed
+    assert len(store.get_pending_processing_jobs(conn)) == 0
+
+
+def test_regression_n2_all_cluster_member_jobs_completed(tmp_path: Path, monkeypatch):
+    """N2: All members of a cluster have their processing jobs marked completed (not just primary)."""
+    from src.vendor_watch import runner
+    db_path = tmp_path / "test.db"
+    conn = store.get_connection(db_path)
+
+    ev1 = parser.FeedEntry(
+        entry_id="gemini-flash-blog",
+        title="Gemini 2.5 Flash GA in Vertex AI",
+        link="https://blog.google/gemini-25",
+        published_at="2026-10-28T01:00:00Z",
+        summary="Gemini 2.5 Flash GA",
+        raw_content="gemini-2.5-flash general availability announcement.",
+    )
+    ev2 = parser.FeedEntry(
+        entry_id="gemini-flash-notes",
+        title="Vertex AI Release: Gemini 2.5 Flash",
+        link="https://cloud.google.com/vertex/gemini-25",
+        published_at="2026-10-28T02:00:00Z",
+        summary="Gemini 2.5 Flash release notes",
+        raw_content="gemini-2.5-flash GA in Vertex console.",
+    )
+    src1 = {"id": "src-blog", "vendor": "Google", "product": "Vertex AI"}
+    src2 = {"id": "src-notes", "vendor": "Google", "product": "Vertex AI"}
+
+    store.record_unseen_entries(conn, src1, [ev1])
+    store.record_unseen_entries(conn, src2, [ev2])
+
+    assert len(store.get_pending_processing_jobs(conn)) == 2
+
+    monkeypatch.setattr(runner, "load_sources", lambda: [])
+    monkeypatch.setattr(delivery, "deliver", lambda text, dry_run=False, conn=None, outbox_id=None: (True, ""))
+
+    runner.run_cycle(db_path=db_path, dry_run=False, once=True)
+
+    # Both cluster members must be completed
+    assert len(store.get_pending_processing_jobs(conn)) == 0
+
+
+def test_regression_n3_stable_release_referencing_prerelease_in_body_is_not_prerelease():
+    """N3: Stable release whose body says 'Upgrade from v1.2.3-beta.1' is classified as stable, never prerelease."""
+    ev = {
+        "title": "Release v1.2.3",
+        "entry_id": "v1.2.3",
+        "raw_content": "Upgrade guide: Migration from v1.2.3-beta.1 to stable v1.2.3 release.",
+    }
+    t_type, prio = triage.classify_event(ev)
+    assert t_type != "prerelease"
+    assert prio != "ignore"
+    assert t_type == "sdk_patch"
+    assert prio == "digest"
+
+
+def test_regression_n4_removed_recipient_not_contacted_on_retry(tmp_path: Path, monkeypatch):
+    """N4: A recipient removed from configuration is NOT contacted on retry."""
+    db_path = tmp_path / "test.db"
+    conn = store.get_connection(db_path)
+
+    out_id = store.add_to_outbox(conn, "ev-n4", "high", "Alert text")
+    monkeypatch.setenv("BOT_TOKEN", "mock-token")
+
+    # Initial delivery attempt: chat-ok succeeds, chat-removed fails
+    monkeypatch.setattr(delivery, "get_target_chat_ids", lambda: ["chat-ok", "chat-removed"])
+    def mock_send_1(token, chat_id, text, timeout=15):
+        if chat_id == "chat-removed":
+            raise RuntimeError("Temporary Telegram outage for chat-removed")
+
+    monkeypatch.setattr(delivery, "send_to_telegram", mock_send_1)
+    delivery.deliver("Alert text", dry_run=False, conn=conn, outbox_id=out_id)
+
+    # Configuration changes: chat-removed is removed from config!
+    monkeypatch.setattr(delivery, "get_target_chat_ids", lambda: ["chat-ok"])
+
+    sent_on_retry = []
+    def mock_send_retry(token, chat_id, text, timeout=15):
+        sent_on_retry.append(chat_id)
+
+    monkeypatch.setattr(delivery, "send_to_telegram", mock_send_retry)
+
+    # Retry delivery
+    success, err = delivery.deliver("Alert text", dry_run=False, conn=conn, outbox_id=out_id)
+    assert success is True
+    # chat-removed must NOT be contacted!
+    assert "chat-removed" not in sent_on_retry
+    assert sent_on_retry == []
+
+
+def test_regression_n5_legacy_db_2401697_upgrade_unchanged_feed_zero_new_events(tmp_path: Path):
+    """N5: An existing DB created by commit 2401697 is upgraded without replaying seen entries when parsing an unchanged feed."""
+    import sqlite3
+    db_file = tmp_path / "legacy_2401697.db"
+
+    # Create exact 2401697 legacy DB with an Atom feed entry parsed by 2401697
+    atom_xml = """<?xml version="1.0" encoding="utf-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <entry>
+        <id>tag:github.com,2008:Repository/12345/v1.0.0</id>
+        <title>Release v1.0.0</title>
+        <link href="https://example.com/v1"/>
+        <summary type="html">&lt;p&gt;Initial summary text with html&lt;/p&gt;</summary>
+      </entry>
+    </feed>"""
+
+    # In 2401697, raw_content was '<p>Initial summary text with html</p>' and title 'Release v1.0.0'
+    legacy_content = "<p>Initial summary text with html</p>"
+    legacy_hash = store.make_content_hash("Release v1.0.0", legacy_content)
+    event_id = "src-atom:tag:github.com,2008:Repository/12345/v1.0.0"
+
+    conn = sqlite3.connect(str(db_file))
+    conn.executescript(f"""
+        CREATE TABLE sources_meta (
+            source_id TEXT PRIMARY KEY,
+            etag TEXT DEFAULT '',
+            last_modified TEXT DEFAULT '',
+            last_fetched_at TEXT DEFAULT '',
+            last_status INTEGER DEFAULT 0,
+            fail_count INTEGER DEFAULT 0,
+            is_baseline_done INTEGER DEFAULT 1
+        );
+        CREATE TABLE events (
+            id TEXT PRIMARY KEY,
+            source_id TEXT,
+            entry_id TEXT,
+            vendor TEXT,
+            product TEXT,
+            title TEXT,
+            link TEXT,
+            published_at TEXT,
+            content_hash TEXT,
+            revision INTEGER DEFAULT 1,
+            raw_content TEXT,
+            triage_type TEXT DEFAULT '',
+            priority TEXT DEFAULT '',
+            cluster_id TEXT DEFAULT '',
+            status TEXT DEFAULT 'baseline',
+            first_seen_at TEXT,
+            last_seen_at TEXT
+        );
+        CREATE TABLE outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT,
+            priority TEXT,
+            rendered_text TEXT,
+            status TEXT DEFAULT 'pending',
+            attempts INTEGER DEFAULT 0,
+            last_attempt_at TEXT DEFAULT '',
+            error_message TEXT DEFAULT '',
+            created_at TEXT
+        );
+        INSERT INTO sources_meta (source_id, is_baseline_done) VALUES ('src-atom', 1);
+        INSERT INTO events (id, source_id, entry_id, title, content_hash, raw_content, status)
+        VALUES ('{event_id}', 'src-atom', 'tag:github.com,2008:Repository/12345/v1.0.0', 'Release v1.0.0', '{legacy_hash}', '{legacy_content}', 'baseline');
+    """)
+    conn.commit()
+    conn.close()
+
+    # Open and upgrade DB with new code
+    upgraded_conn = store.get_connection(db_file)
+
+    # Parse the exact same unchanged feed XML using current parser
+    entries = parser.parse_feed(atom_xml)
+    source = {"id": "src-atom", "vendor": "Anthropic", "product": "Claude Code"}
+
+    # Must produce ZERO new events or revisions
+    unseen = store.record_unseen_entries(upgraded_conn, source, entries)
+    assert len(unseen) == 0
+
+    # Ensure no processing jobs were queued
+    jobs = store.get_pending_processing_jobs(upgraded_conn)
+    assert len(jobs) == 0
+
+
+def test_regression_astra_p1_revision_outbox_not_superseded_by_old_revision(tmp_path: Path, monkeypatch):
+    """P1 / Topilma 1: Rev 1 sent bo'lgach, rev 2 xavfsizlik tuzatishi ham alohida outbox yaratib yuboriladi."""
+    from src.vendor_watch import runner
+    db_path = tmp_path / "test.db"
+    conn = store.get_connection(db_path)
+
+    source = {"id": "src-rev-test", "vendor": "Anthropic", "product": "Claude Code"}
+    ev_rev1 = parser.FeedEntry(
+        entry_id="v2.0.0",
+        title="Claude Code v2.0.0",
+        link="https://example.com/v200",
+        published_at="2026-10-28T00:00:00Z",
+        summary="Major release",
+        raw_content="Breaking changes in API.",
+    )
+    store.record_unseen_entries(conn, source, [ev_rev1])
+
+    monkeypatch.setattr(runner, "load_sources", lambda: [])
+    delivered = []
+    monkeypatch.setattr(delivery, "deliver", lambda text, dry_run=False, conn=None, outbox_id=None: (delivered.append(text) or True, ""))
+
+    # 1-run: Rev 1 is sent
+    runner.run_cycle(db_path=db_path, dry_run=False, once=True)
+    assert len(delivered) == 1
+    assert "v2.0.0" in delivered[0]
+
+    # Now feed updates to Rev 2 with a critical security fix
+    ev_rev2 = parser.FeedEntry(
+        entry_id="v2.0.0",
+        title="Claude Code v2.0.0 (Security Patch)",
+        link="https://example.com/v200-sec",
+        published_at="2026-10-28T02:00:00Z",
+        summary="Security update",
+        raw_content="Critical security fix for CVE-2026-9999 vulnerability.",
+    )
+    store.record_unseen_entries(conn, source, [ev_rev2])
+
+    delivered.clear()
+    # 2-run: Rev 2 must NOT be skipped as already sent!
+    runner.run_cycle(db_path=db_path, dry_run=False, once=True)
+    assert len(delivered) == 1
+    assert "CVE-2026-9999" in delivered[0] or "Xavfsizlik" in delivered[0] or "security" in delivered[0].lower()
+
+
+def test_regression_astra_p3_p4_escaped_ampersand_and_quote_url_bounded():
+    """P3/P4 / Topilma 3: 471 belgili '&' va '\"' ko'p URL bilan high, merged va digest xabarlari <= 3900 chars va valid HTML."""
+    base_prefix = "https://example.com/search?q="
+    repeats = 25
+    query_part = "".join(f'tag%22{i}%22=&param_{i}="val_{i}"&' for i in range(repeats))
+    long_url = (base_prefix + query_part)[:471]
+    assert len(long_url) == 471
+    assert "&" in long_url and '"' in long_url
+
+    ev = {
+        "id": "ev-url-bound",
+        "vendor": "Anthropic",
+        "product": "Claude Code",
+        "title": 'Release v2.0.0 "Major & Breaking"',
+        "link": long_url,
+        "links": [long_url],
+        "triage_type": "security",
+        "priority": "high",
+    }
+    enr = {
+        "uz_title": 'Claude Code Yangilanishi "Xavfsizlik & Barqarorlik"',
+        "uz_summary": 'Xavfsizlik bo\'yicha "muhim" yangilanish & tuzatishlar kiritildi.',
+        "uz_benefit": 'Foydalanuvchi tizimi himoyalanadi & barqaror ishlaydi.',
+        "uz_how_to_use": 'claude update --force="all" & restart',
+    }
+
+    # 1. High priority single message
+    high_msg = renderer.render_high_priority_message(ev, enr)
+    assert len(high_msg) <= 3900
+    assert high_msg.count("<a href=") == high_msg.count("</a>")
+    assert high_msg.count("<b>") == high_msg.count("</b>")
+
+    # 2. Merged high priority messages
+    merged_items = [(ev, enr) for _ in range(3)]
+    merged_msgs = renderer.render_merged_high_priority(merged_items)
+    for m in merged_msgs:
+        assert len(m) <= 3900
+        assert m.count("<a href=") == m.count("</a>")
+        assert m.count("<b>") == m.count("</b>")
+
+    # 3. Digest messages
+    digest_items = [(ev, enr) for _ in range(5)]
+    digest_msgs = renderer.render_digest_messages(digest_items)
+    for d in digest_msgs:
+        assert len(d) <= 3900
+        assert d.count("<a href=") == d.count("</a>")
+        assert d.count("<b>") == d.count("</b>")
+
+
+def test_regression_astra_n1_digest_crash_restart_does_not_resend(tmp_path: Path, monkeypatch):
+    """N1 / Topilma 2: Digest yuborilgach, job yopilishidan oldin crash bo'lsa, restartda qayta yubormaydi."""
+    from src.vendor_watch import runner
+    db_path = tmp_path / "test.db"
+    conn = store.get_connection(db_path)
+
+    ev1 = parser.FeedEntry(
+        entry_id="patch-1",
+        title="OpenAI Python SDK v1.50.1",
+        link="https://example.com/p1",
+        published_at="2026-10-28T01:00:00Z",
+        summary="SDK patch 1",
+        raw_content="Routine patch 1.",
+    )
+    ev2 = parser.FeedEntry(
+        entry_id="patch-2",
+        title="Google GenAI Python SDK v0.4.1",
+        link="https://example.com/p2",
+        published_at="2026-10-28T02:00:00Z",
+        summary="SDK patch 2",
+        raw_content="Routine patch 2.",
+    )
+    store.record_unseen_entries(conn, {"id": "src-1", "vendor": "OpenAI", "product": "SDK"}, [ev1])
+    store.record_unseen_entries(conn, {"id": "src-2", "vendor": "Google", "product": "SDK"}, [ev2])
+
+    monkeypatch.setattr(runner, "load_sources", lambda: [])
+    sent_messages = []
+    monkeypatch.setattr(delivery, "deliver", lambda text, dry_run=False, conn=None, outbox_id=None: (sent_messages.append(text) or True, ""))
+
+    # Simulate: digest is rendered and sent, outbox is updated to 'sent', but crash occurs before mark_processing_job_done
+    digest_pages = renderer.render_digest_pages([
+        ({"id": "src-1:patch-1", "vendor": "OpenAI", "product": "SDK", "title": ev1.title, "link": ev1.link, "links": [ev1.link]}, {"uz_title": ev1.title, "uz_summary": ev1.summary}),
+        ({"id": "src-2:patch-2", "vendor": "Google", "product": "SDK", "title": ev2.title, "link": ev2.link, "links": [ev2.link]}, {"uz_title": ev2.title, "uz_summary": ev2.summary}),
+    ])
+    for d_msg, page_items in digest_pages:
+        page_events = [it[0] for it in page_items]
+        out_id = store.add_to_outbox(conn, "digest", "digest", d_msg)
+        store.link_outbox_events(conn, out_id, page_events)
+        store.update_outbox_status(conn, out_id, "sent")
+
+    assert len(store.get_pending_processing_jobs(conn)) == 2
+
+    sent_messages.clear()
+    runner.run_cycle(db_path=db_path, dry_run=False, digest_mode=True, once=True)
+
+    # Must NOT re-send digest message!
+    assert len(sent_messages) == 0
+    # Jobs must now be completed
+    assert len(store.get_pending_processing_jobs(conn)) == 0
+
+
+def test_regression_astra_p6_failed_digest_retried_sent_cross_run_dedup(tmp_path: Path, monkeypatch):
+    """P6 / Topilma 5: Dastlab failed bo'lgan digest retryda sent bo'lsa, event_notifications 'sent' bo'ladi va boshqa manbadagi ayni reliz qayta yuborilmaydi."""
+    from src.vendor_watch import runner
+    db_path = tmp_path / "test.db"
+    conn = store.get_connection(db_path)
+
+    ev1 = parser.FeedEntry(
+        entry_id="v1.60.0",
+        title="Release v1.60.0",
+        link="https://example.com/v160",
+        published_at="2026-10-28T01:00:00Z",
+        summary="SDK minor patch",
+        raw_content="SDK patch v1.60.0 release notes.",
+    )
+    src1 = {"id": "src-p6-a", "vendor": "OpenAI", "product": "OpenAI Python SDK"}
+    store.record_unseen_entries(conn, src1, [ev1])
+
+    monkeypatch.setattr(runner, "load_sources", lambda: [])
+
+    # Run 1: Telegram send FAILS
+    monkeypatch.setattr(delivery, "deliver", lambda text, dry_run=False, conn=None, outbox_id=None: (False, "Network error"))
+    runner.run_cycle(db_path=db_path, dry_run=False, digest_mode=True, once=True)
+
+    cur = conn.cursor()
+    cur.execute("SELECT status FROM event_notifications WHERE event_id = 'src-p6-a:v1.60.0'")
+    row = cur.fetchone()
+    assert row is not None and row[0] == "failed"
+
+    # Run 2: Retry succeeds!
+    delivered = []
+    monkeypatch.setattr(delivery, "deliver", lambda text, dry_run=False, conn=None, outbox_id=None: (delivered.append(text) or True, ""))
+    runner.run_cycle(db_path=db_path, dry_run=False, digest_mode=True, once=True)
+    assert len(delivered) == 1
+
+    cur.execute("SELECT status FROM event_notifications WHERE event_id = 'src-p6-a:v1.60.0'")
+    row = cur.fetchone()
+    assert row is not None and row[0] == "sent"
+
+    # Run 3: Same release announced from another source 3 hours later
+    ev2 = parser.FeedEntry(
+        entry_id="news-v1.60.0",
+        title="OpenAI Python SDK v1.60.0",
+        link="https://example.com/news-160",
+        published_at="2026-10-28T04:00:00Z",
+        summary="SDK update",
+        raw_content="v1.60.0 announcement.",
+    )
+    src2 = {"id": "src-p6-b", "vendor": "OpenAI", "product": "OpenAI Python SDK"}
+    store.record_unseen_entries(conn, src2, [ev2])
+
+    delivered.clear()
+    runner.run_cycle(db_path=db_path, dry_run=False, digest_mode=True, once=True)
+
+    # Must be deduplicated against the retried 'sent' notification!
+    assert len(delivered) == 0
+
+
+def test_regression_astra_p6_multipage_digest_per_page_notification_status(tmp_path: Path, monkeypatch):
+    """Topilma 6: Multipage digestda har sahifaning yetkazilish natijasi faqat o'z a'zolariga yoziladi."""
+    from src.vendor_watch import runner
+    db_path = tmp_path / "test.db"
+    conn = store.get_connection(db_path)
+
+    # Ingest 20 entries with substantial summaries to force multiple digest pages
+    for i in range(20):
+        ev = parser.FeedEntry(
+            entry_id=f"entry-{i}",
+            title=f"Release v{i}.0.0 with multiple new features and migration updates",
+            link=f"https://example.com/entry/{i}",
+            published_at="2026-10-28T01:00:00Z",
+            summary="Summary text " * 30,
+            raw_content="Detailed content " * 40,
+        )
+        store.record_unseen_entries(conn, {"id": f"src-multi-{i}", "vendor": f"Vendor {i}", "product": "SDK"}, [ev])
+
+    monkeypatch.setattr(runner, "load_sources", lambda: [])
+
+    # Delivery mock: page 1 fails, page 2 succeeds
+    delivery_attempts = []
+    def mock_deliver(text, dry_run=False, conn=None, outbox_id=None):
+        idx = len(delivery_attempts)
+        delivery_attempts.append(outbox_id)
+        if idx == 0:
+            return False, "Page 1 temporary failure"
+        return True, ""
+
+    monkeypatch.setattr(delivery, "deliver", mock_deliver)
+
+    runner.run_cycle(db_path=db_path, dry_run=False, fixtures=True, digest_mode=True, once=True)
+
+    assert len(delivery_attempts) >= 2
+
+    cur = conn.cursor()
+    cur.execute("SELECT status, count(*) FROM event_notifications GROUP BY status")
+    counts = dict(cur.fetchall())
+    assert "failed" in counts
+    assert "sent" in counts
+    assert counts["failed"] > 0
+    assert counts["sent"] > 0
+    assert counts["failed"] + counts["sent"] == 20
+
+
+def test_regression_astra_n5_atom_and_rss_summary_before_content_legacy_hash_upgrade(tmp_path: Path):
+    """N5 / Topilma 4: Haqiqiy Atom (<summary> oldin) va RSS (<description> oldin) feedlari 2401697 DB bilan 0 yangi event beradi."""
+    import sqlite3
+    db_file = tmp_path / "legacy_2401697_real.db"
+
+    atom_xml = """<?xml version="1.0" encoding="utf-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <entry>
+        <id>tag:github.com,2008:Repository/atom1</id>
+        <title>Release v1.0.0</title>
+        <link href="https://example.com/atom1"/>
+        <summary>Short summary text</summary>
+        <content>Full detailed content of the release notes</content>
+      </entry>
+    </feed>"""
+
+    rss_xml = """<?xml version="1.0" encoding="utf-8"?>
+    <rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+      <channel>
+        <title>Test RSS</title>
+        <item>
+          <guid>rss-guid-1</guid>
+          <title>RSS Release v2.0.0</title>
+          <link>https://example.com/rss1</link>
+          <description>Short description text</description>
+          <content:encoded>Full encoded content in CDATA or text</content:encoded>
+        </item>
+      </channel>
+    </rss>"""
+
+    atom_legacy_content = "Short summary text"
+    atom_legacy_hash = store.make_content_hash("Release v1.0.0", atom_legacy_content)
+    atom_event_id = "src-atom:tag:github.com,2008:Repository/atom1"
+
+    rss_legacy_content = "Short description text"
+    rss_legacy_hash = store.make_content_hash("RSS Release v2.0.0", rss_legacy_content)
+    rss_event_id = "src-rss:rss-guid-1"
+
+    conn = sqlite3.connect(str(db_file))
+    conn.executescript(f"""
+        CREATE TABLE sources_meta (
+            source_id TEXT PRIMARY KEY,
+            etag TEXT DEFAULT '',
+            last_modified TEXT DEFAULT '',
+            last_fetched_at TEXT DEFAULT '',
+            last_status INTEGER DEFAULT 0,
+            fail_count INTEGER DEFAULT 0,
+            is_baseline_done INTEGER DEFAULT 1
+        );
+        CREATE TABLE events (
+            id TEXT PRIMARY KEY,
+            source_id TEXT,
+            entry_id TEXT,
+            vendor TEXT,
+            product TEXT,
+            title TEXT,
+            link TEXT,
+            published_at TEXT,
+            content_hash TEXT,
+            revision INTEGER DEFAULT 1,
+            raw_content TEXT,
+            triage_type TEXT DEFAULT '',
+            priority TEXT DEFAULT '',
+            cluster_id TEXT DEFAULT '',
+            status TEXT DEFAULT 'baseline',
+            first_seen_at TEXT,
+            last_seen_at TEXT
+        );
+        CREATE TABLE outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT,
+            priority TEXT,
+            rendered_text TEXT,
+            status TEXT DEFAULT 'pending',
+            attempts INTEGER DEFAULT 0,
+            last_attempt_at TEXT DEFAULT '',
+            error_message TEXT DEFAULT '',
+            created_at TEXT
+        );
+        INSERT INTO sources_meta (source_id, is_baseline_done) VALUES ('src-atom', 1), ('src-rss', 1);
+        INSERT INTO events (id, source_id, entry_id, title, content_hash, raw_content, status)
+        VALUES ('{atom_event_id}', 'src-atom', 'tag:github.com,2008:Repository/atom1', 'Release v1.0.0', '{atom_legacy_hash}', '{atom_legacy_content}', 'baseline'),
+               ('{rss_event_id}', 'src-rss', 'rss-guid-1', 'RSS Release v2.0.0', '{rss_legacy_hash}', '{rss_legacy_content}', 'baseline');
+    """)
+    conn.commit()
+    conn.close()
+
+    upgraded_conn = store.get_connection(db_file)
+
+    atom_entries = parser.parse_feed(atom_xml)
+    atom_unseen = store.record_unseen_entries(upgraded_conn, {"id": "src-atom", "vendor": "Anthropic", "product": "SDK"}, atom_entries)
+    assert len(atom_unseen) == 0
+
+    rss_entries = parser.parse_feed(rss_xml)
+    rss_unseen = store.record_unseen_entries(upgraded_conn, {"id": "src-rss", "vendor": "Google", "product": "SDK"}, rss_entries)
+    assert len(rss_unseen) == 0
+
+    assert len(store.get_pending_processing_jobs(upgraded_conn)) == 0
+
