@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>anthropic-sdk-python releases</title>
+  <id>https://github.com/anthropics/anthropic-sdk-python/releases</id>
+  <updated>2026-10-24T10:00:00Z</updated>
+  <entry>
+    <id>tag:github.com,2008:Repository/103/v0.34.1</id>
+    <title>Release v0.34.1</title>
+    <link rel="alternate" type="text/html" href="https://github.com/anthropics/anthropic-sdk-python/releases/tag/v0.34.1"/>
+    <published>2026-10-24T10:00:00Z</published>
+    <updated>2026-10-24T10:00:00Z</updated>
+    <content type="text">Patch release fixing connection pooling with httpx.</content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Repository/103/v0.34.0</id>
+    <title>Release v0.34.0</title>
+    <link rel="alternate" type="text/html" href="https://github.com/anthropics/anthropic-sdk-python/releases/tag/v0.34.0"/>
+    <published>2026-09-20T00:00:00Z</published>
+    <updated>2026-09-20T00:00:00Z</updated>
+    <content type="text">Minor release.</content>
+  </entry>
+</feed>

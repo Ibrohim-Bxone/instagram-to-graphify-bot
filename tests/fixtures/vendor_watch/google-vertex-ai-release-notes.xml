@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Vertex AI Release Notes</title>
+  <id>https://cloud.google.com/feeds/vertex-ai-release-notes.xml</id>
+  <updated>2026-10-28T00:00:00Z</updated>
+  <entry>
+    <id>https://cloud.google.com/vertex-ai/docs/release-notes#oct-28-2026-gemini-25</id>
+    <title>Gemini 2.5 Flash GA in Vertex AI</title>
+    <link rel="alternate" type="text/html" href="https://cloud.google.com/vertex-ai/docs/release-notes#gemini-25-flash-ga"/>
+    <published>2026-10-28T00:00:00Z</published>
+    <updated>2026-10-28T00:00:00Z</updated>
+    <content type="text">Vertex AI announces the general availability of Gemini 2.5 Flash with reduced latency and improved context caching.</content>
+  </entry>
+  <entry>
+    <id>https://cloud.google.com/vertex-ai/docs/release-notes#sept-15-2026</id>
+    <title>Vertex AI September Updates</title>
+    <link rel="alternate" type="text/html" href="https://cloud.google.com/vertex-ai/docs/release-notes#sept-15"/>
+    <published>2026-09-15T00:00:00Z</published>
+    <updated>2026-09-15T00:00:00Z</updated>
+    <content type="text">Earlier updates for Vertex AI.</content>
+  </entry>
+</feed>

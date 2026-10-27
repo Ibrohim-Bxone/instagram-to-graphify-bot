@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>openai-codex releases</title>
+  <id>https://github.com/openai/codex/releases</id>
+  <updated>2026-10-27T12:00:00Z</updated>
+  <entry>
+    <id>tag:github.com,2008:Repository/789/v2.1.0</id>
+    <title>Codex CLI v2.1.0 - GPT-6 Astra integration</title>
+    <link rel="alternate" type="text/html" href="https://github.com/openai/codex/releases/tag/v2.1.0"/>
+    <published>2026-10-27T12:00:00Z</published>
+    <updated>2026-10-27T12:00:00Z</updated>
+    <content type="text">New model integration: OpenAI GPT-6 Astra reasoning model now supported for adversarial code analysis and independent verification.</content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Repository/789/v2.0.0</id>
+    <title>Codex CLI v2.0.0</title>
+    <link rel="alternate" type="text/html" href="https://github.com/openai/codex/releases/tag/v2.0.0"/>
+    <published>2026-10-01T00:00:00Z</published>
+    <updated>2026-10-01T00:00:00Z</updated>
+    <content type="text">Codex 2.0 release.</content>
+  </entry>
+</feed>

@@ -1,0 +1,79 @@
+[
+  {
+    "id": "anthropic-claude-code",
+    "vendor": "Anthropic",
+    "product": "Claude Code",
+    "url": "https://github.com/anthropics/claude-code/releases.atom",
+    "kind": "atom"
+  },
+  {
+    "id": "openai-codex",
+    "vendor": "OpenAI",
+    "product": "Codex CLI",
+    "url": "https://github.com/openai/codex/releases.atom",
+    "kind": "atom"
+  },
+  {
+    "id": "google-gemini-cli",
+    "vendor": "Google",
+    "product": "Gemini CLI",
+    "url": "https://github.com/google-gemini/gemini-cli/releases.atom",
+    "kind": "atom"
+  },
+  {
+    "id": "google-python-genai",
+    "vendor": "Google",
+    "product": "Google GenAI Python SDK",
+    "url": "https://github.com/googleapis/python-genai/releases.atom",
+    "kind": "atom"
+  },
+  {
+    "id": "anthropic-sdk-python",
+    "vendor": "Anthropic",
+    "product": "Anthropic Python SDK",
+    "url": "https://github.com/anthropics/anthropic-sdk-python/releases.atom",
+    "kind": "atom"
+  },
+  {
+    "id": "openai-python",
+    "vendor": "OpenAI",
+    "product": "OpenAI Python SDK",
+    "url": "https://github.com/openai/openai-python/releases.atom",
+    "kind": "atom"
+  },
+  {
+    "id": "openai-news",
+    "vendor": "OpenAI",
+    "product": "OpenAI News",
+    "url": "https://openai.com/news/rss.xml",
+    "kind": "rss"
+  },
+  {
+    "id": "google-vertex-ai-release-notes",
+    "vendor": "Google",
+    "product": "Vertex AI Release Notes",
+    "url": "https://cloud.google.com/feeds/vertex-ai-release-notes.xml",
+    "kind": "atom"
+  },
+  {
+    "id": "google-developers-blog",
+    "vendor": "Google",
+    "product": "Google Developers Blog",
+    "url": "https://developers.googleblog.com/feeds/posts/default",
+    "kind": "atom"
+  },
+  {
+    "id": "google-blog-gemini",
+    "vendor": "Google",
+    "product": "Google Gemini Blog",
+    "url": "https://blog.google/products/gemini/rss/",
+    "kind": "rss"
+  },
+  {
+    "id": "google-deepmind-blog",
+    "vendor": "Google",
+    "product": "Google DeepMind Blog",
+    "url": "https://blog.google/technology/google-deepmind/rss/",
+    "kind": "rss"
+  }
+]

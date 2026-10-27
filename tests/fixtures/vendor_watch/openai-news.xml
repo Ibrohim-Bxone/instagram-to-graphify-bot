@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>OpenAI News</title>
+    <link>https://openai.com/news/</link>
+    <description>The latest news and announcements from OpenAI</description>
+    <item>
+      <title>OpenAI Developer Platform updates</title>
+      <link>https://openai.com/news/dev-platform-oct-2026</link>
+      <guid>https://openai.com/news/dev-platform-oct-2026</guid>
+      <pubDate>Wed, 28 Oct 2026 00:00:00 GMT</pubDate>
+      <description>We are introducing updates to our developer platform with new capabilities and expanded rate limits.</description>
+    </item>
+    <item>
+      <title>Earlier OpenAI Post</title>
+      <link>https://openai.com/news/sept-2026</link>
+      <guid>https://openai.com/news/sept-2026</guid>
+      <pubDate>Mon, 01 Sep 2026 00:00:00 GMT</pubDate>
+      <description>Earlier announcement details.</description>
+    </item>
+  </channel>
+</rss>

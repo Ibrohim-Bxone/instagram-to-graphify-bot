@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>google-python-genai releases</title>
+  <id>https://github.com/googleapis/python-genai/releases</id>
+  <updated>2026-10-25T10:00:00Z</updated>
+  <entry>
+    <id>tag:github.com,2008:Repository/102/v0.4.1</id>
+    <title>Release v0.4.1</title>
+    <link rel="alternate" type="text/html" href="https://github.com/googleapis/python-genai/releases/tag/v0.4.1"/>
+    <published>2026-10-25T10:00:00Z</published>
+    <updated>2026-10-25T10:00:00Z</updated>
+    <content type="text">Patch update fixing type hints for streaming tokens.</content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Repository/102/v0.4.0</id>
+    <title>Release v0.4.0</title>
+    <link rel="alternate" type="text/html" href="https://github.com/googleapis/python-genai/releases/tag/v0.4.0"/>
+    <published>2026-09-15T00:00:00Z</published>
+    <updated>2026-09-15T00:00:00Z</updated>
+    <content type="text">Minor release.</content>
+  </entry>
+</feed>

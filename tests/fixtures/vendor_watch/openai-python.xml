@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>openai-python releases</title>
+  <id>https://github.com/openai/openai-python/releases</id>
+  <updated>2026-10-28T00:00:00Z</updated>
+  <entry>
+    <id>tag:github.com,2008:Repository/456/v1.52.1</id>
+    <title>Release v1.52.1</title>
+    <link rel="alternate" type="text/html" href="https://github.com/openai/openai-python/releases/tag/v1.52.1"/>
+    <published>2026-10-28T00:00:00Z</published>
+    <updated>2026-10-28T00:00:00Z</updated>
+    <content type="text">Patch release fixing retry handler timeouts in stream connections. No breaking changes. Update with `pip install --upgrade openai`.</content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Repository/456/v1.52.0</id>
+    <title>Release v1.52.0</title>
+    <link rel="alternate" type="text/html" href="https://github.com/openai/openai-python/releases/tag/v1.52.0"/>
+    <published>2026-10-20T00:00:00Z</published>
+    <updated>2026-10-20T00:00:00Z</updated>
+    <content type="text">Added support for new reasoning parameters.</content>
+  </entry>
+</feed>

@@ -1,0 +1,5 @@
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Malformed Unclosed XML
+  <entry>
+    <id>broken-1</id>
+    <title>Broken Entry
