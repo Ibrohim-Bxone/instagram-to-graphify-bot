@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 import sqlite3
 
-from . import delivery, enricher, fetcher, parser, renderer, store, triage
+from . import delivery, enricher, fetcher, parser, probes, renderer, store, triage
 
 log = logging.getLogger("vendor_watch")
 
@@ -39,6 +39,8 @@ def run_cycle(
     digest_mode: bool = False,
     baseline_digest: bool = False,
     fixtures_dir: Path | None = None,
+    probes_only: bool = False,
+    run_probes: bool = False,
 ) -> None:
     if dry_run:
         # Dry-run must not mutate persistent state. Work on an in-memory copy.
@@ -99,54 +101,63 @@ def run_cycle(
     new_events: list[dict] = []
     baseline_digest_items: list[dict] = []
 
-    # 2. Ingest feeds from each source
-    for src in sources:
-        sid = src["id"]
-        meta = store.get_source_meta(conn, sid)
-        fetch_res = fetcher.fetch_feed(
-            src,
-            snapshot=meta,
-            fixtures_dir=fixtures_dir if fixtures else None,
-        )
+    # 2. Ingest feeds from each source (unless probes_only)
+    if not probes_only:
+        for src in sources:
+            sid = src["id"]
+            meta = store.get_source_meta(conn, sid)
+            fetch_res = fetcher.fetch_feed(
+                src,
+                snapshot=meta,
+                fixtures_dir=fixtures_dir if fixtures else None,
+            )
 
-        if fetch_res.not_modified:
-            continue
+            if fetch_res.not_modified:
+                continue
 
-        if fetch_res.status != 200 or not fetch_res.content:
-            log.warning("Source %s fetch xatosi: %s", sid, fetch_res.error)
-            store.mark_source_failure(conn, sid, status_code=fetch_res.status)
-            continue
+            if fetch_res.status != 200 or not fetch_res.content:
+                log.warning("Source %s fetch xatosi: %s", sid, fetch_res.error)
+                store.mark_source_failure(conn, sid, status_code=fetch_res.status)
+                continue
 
-        try:
-            entries = parser.parse_feed(fetch_res.content)
-        except parser.FeedParseError as e:
-            log.warning("Source %s parse xatosi: %s (snapshot saqlandi)", sid, e)
-            store.mark_source_failure(conn, sid, status_code=500)
-            continue
+            try:
+                entries = parser.parse_feed(fetch_res.content)
+            except parser.FeedParseError as e:
+                log.warning("Source %s parse xatosi: %s (snapshot saqlandi)", sid, e)
+                store.mark_source_failure(conn, sid, status_code=500)
+                continue
 
-        is_baseline_done = bool(meta and meta.get("is_baseline_done"))
+            is_baseline_done = bool(meta and meta.get("is_baseline_done"))
 
-        if not is_baseline_done:
-            if fixtures:
-                # In fixtures mode on fresh DB: seed older entries, treat latest as new
-                if len(entries) > 1:
-                    older_entries = entries[1:]
-                    latest_entries = entries[:1]
-                    store.record_baseline(
-                        conn,
-                        src,
-                        older_entries,
-                        etag=fetch_res.etag,
-                        last_modified=fetch_res.last_modified,
-                    )
-                    unseen = store.record_unseen_entries(
-                        conn,
-                        src,
-                        latest_entries,
-                        etag=fetch_res.etag,
-                        last_modified=fetch_res.last_modified,
-                    )
-                    new_events.extend(unseen)
+            if not is_baseline_done:
+                if fixtures:
+                    # In fixtures mode on fresh DB: seed older entries, treat latest as new
+                    if len(entries) > 1:
+                        older_entries = entries[1:]
+                        latest_entries = entries[:1]
+                        store.record_baseline(
+                            conn,
+                            src,
+                            older_entries,
+                            etag=fetch_res.etag,
+                            last_modified=fetch_res.last_modified,
+                        )
+                        unseen = store.record_unseen_entries(
+                            conn,
+                            src,
+                            latest_entries,
+                            etag=fetch_res.etag,
+                            last_modified=fetch_res.last_modified,
+                        )
+                        new_events.extend(unseen)
+                    else:
+                        store.record_baseline(
+                            conn,
+                            src,
+                            entries,
+                            etag=fetch_res.etag,
+                            last_modified=fetch_res.last_modified,
+                        )
                 else:
                     store.record_baseline(
                         conn,
@@ -156,22 +167,19 @@ def run_cycle(
                         last_modified=fetch_res.last_modified,
                     )
             else:
-                store.record_baseline(
+                unseen = store.record_unseen_entries(
                     conn,
                     src,
                     entries,
                     etag=fetch_res.etag,
                     last_modified=fetch_res.last_modified,
                 )
-        else:
-            unseen = store.record_unseen_entries(
-                conn,
-                src,
-                entries,
-                etag=fetch_res.etag,
-                last_modified=fetch_res.last_modified,
-            )
-            new_events.extend(unseen)
+                new_events.extend(unseen)
+
+    # 2b. Run Tier-3 account probes
+    if run_probes or probes_only:
+        probe_events = probes.run_all_probes(conn, fixtures=fixtures)
+        new_events.extend(probe_events)
 
     if baseline_digest:
         baseline_digest_items = store.get_recent_baseline_entries(conn, days=7)
@@ -179,16 +187,24 @@ def run_cycle(
     # 3. Combine newly discovered events with resumed unfinished jobs
     events_by_id: dict[str, dict] = {}
     for uj in unfinished_jobs:
-        u_type, u_prio = triage.classify_event(uj)
+        if uj.get("triage_type") == "account_change":
+            u_type = "account_change"
+            u_prio = uj.get("priority", "high")
+        else:
+            u_type, u_prio = triage.classify_event(uj)
         uj["triage_type"] = u_type
         uj["priority"] = u_prio
         events_by_id[uj["id"]] = uj
 
     for ne in new_events:
         nid = ne["id"]
-        n_type, n_prio = triage.classify_event(ne)
-        ne["triage_type"] = n_type
-        ne["priority"] = n_prio
+        if ne.get("triage_type") == "account_change":
+            n_type = "account_change"
+            n_prio = ne.get("priority", "high")
+        else:
+            n_type, n_prio = triage.classify_event(ne)
+            ne["triage_type"] = n_type
+            ne["priority"] = n_prio
 
         if nid not in events_by_id:
             events_by_id[nid] = ne
@@ -218,16 +234,17 @@ def run_cycle(
 
         t_type = ev.get("triage_type")
         prio = ev.get("priority")
-        if not t_type or not prio:
-            t_type, prio = triage.classify_event(ev)
-            ev["triage_type"] = t_type
-            ev["priority"] = prio
-        else:
-            c_type, c_prio = triage.classify_event(ev)
-            if triage.SEVERITY_ORDER.get(c_type, 10) > triage.SEVERITY_ORDER.get(t_type, 10):
-                ev["triage_type"] = c_type
-                ev["priority"] = c_prio
-                t_type, prio = c_type, c_prio
+        if t_type != "account_change":
+            if not t_type or not prio:
+                t_type, prio = triage.classify_event(ev)
+                ev["triage_type"] = t_type
+                ev["priority"] = prio
+            else:
+                c_type, c_prio = triage.classify_event(ev)
+                if triage.SEVERITY_ORDER.get(c_type, 10) > triage.SEVERITY_ORDER.get(t_type, 10):
+                    ev["triage_type"] = c_type
+                    ev["priority"] = c_prio
+                    t_type, prio = c_type, c_prio
 
         # Compare with persisted clusters from last 24h
         already_notified = False
@@ -261,21 +278,32 @@ def run_cycle(
     for ev in filtered_events:
         t_type = ev.get("triage_type")
         prio = ev.get("priority")
-        if not t_type or not prio:
-            t_type, prio = triage.classify_event(ev)
-            ev["triage_type"] = t_type
-            ev["priority"] = prio
+        if t_type != "account_change":
+            if not t_type or not prio:
+                t_type, prio = triage.classify_event(ev)
+                ev["triage_type"] = t_type
+                ev["priority"] = prio
 
         # Pre-releases with priority 'ignore' are noise (excluded from digest and immediate)
         if prio == "ignore" or t_type == "prerelease":
             _mark_all_done(conn, ev)
             continue
 
-        enrichment = enricher.enrich_event(
-            ev,
-            profile_text=profile_text,
-            use_stub=fixtures,
-        )
+        if t_type == "account_change":
+            enrichment = {
+                "uz_title": ev.get("title", ""),
+                "uz_summary": ev.get("summary") or ev.get("raw_content", ""),
+                "uz_benefit": ev.get("profile_impact", ""),
+                "uz_how_to_use": ev.get("command", ""),
+                "possible_overlap_with_custom_tool": None,
+                "is_raw_mode": False,
+            }
+        else:
+            enrichment = enricher.enrich_event(
+                ev,
+                profile_text=profile_text,
+                use_stub=fixtures,
+            )
 
         if prio == "high":
             high_priority_items.append((ev, enrichment))
@@ -401,6 +429,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--fixtures", action="store_true", help="Read feeds from tests/fixtures/vendor_watch/ and use stub enricher")
     p.add_argument("--digest", action="store_true", help="Generate and send daily digest")
     p.add_argument("--baseline-digest", action="store_true", help="Generate 7-day digest on initial baseline")
+    p.add_argument("--probes-only", action="store_true", help="Run only account and tool probes without fetching feeds")
     p.add_argument("--db", type=str, default="data/vendor_watch.db", help="Path to SQLite database")
     return p
 
@@ -420,4 +449,7 @@ def main(argv: list[str] | None = None) -> None:
         once=args.once,
         digest_mode=args.digest,
         baseline_digest=args.baseline_digest,
+        probes_only=args.probes_only,
+        run_probes=bool(args.once or args.probes_only),
     )
+

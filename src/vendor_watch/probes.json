@@ -1,0 +1,63 @@
+{
+  "agy_models": {
+    "enabled": true,
+    "command": ["agy", "models"],
+    "fallback_paths": [
+      "C:/Users/user/AppData/Local/agy/bin/agy.exe",
+      "/usr/local/bin/agy"
+    ],
+    "timeout": 15
+  },
+  "agy_changelog": {
+    "enabled": true,
+    "command": ["agy", "changelog"],
+    "fallback_paths": [
+      "C:/Users/user/AppData/Local/agy/bin/agy.exe",
+      "/usr/local/bin/agy"
+    ],
+    "timeout": 15
+  },
+  "cli_versions": {
+    "enabled": true,
+    "tools": {
+      "codex": {
+        "command": ["codex", "--version"],
+        "fallback_paths": [],
+        "source_id": "openai-codex",
+        "product": "Codex CLI",
+        "vendor": "OpenAI"
+      },
+      "claude": {
+        "command": ["claude", "--version"],
+        "fallback_paths": [],
+        "source_id": "anthropic-claude-code",
+        "product": "Claude Code",
+        "vendor": "Anthropic"
+      },
+      "agy": {
+        "command": ["agy", "--version"],
+        "fallback_paths": [
+          "C:/Users/user/AppData/Local/agy/bin/agy.exe",
+          "/usr/local/bin/agy"
+        ],
+        "source_id": "google-gemini-cli",
+        "product": "Antigravity (agy)",
+        "vendor": "Google"
+      }
+    },
+    "timeout": 10
+  },
+  "vertex_models": {
+    "enabled": true,
+    "project": "project-92b77c1d-c511-47ce-965",
+    "location": "global",
+    "timeout": 15,
+    "candidate_models": [
+      "gemini-2.5-flash",
+      "gemini-2.5-pro",
+      "gemini-3.7-flash",
+      "gemini-4-argon",
+      "gemini-3.1-pro-high"
+    ]
+  }
+}

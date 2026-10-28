@@ -6,6 +6,17 @@ import pytest
 from src.vendor_watch import delivery, enricher, fetcher, parser, renderer, store, triage
 
 
+@pytest.fixture(autouse=True)
+def _block_real_vertex(monkeypatch):
+    # Testlar haqiqiy Vertex'ga chiqmasin; kerakli testlar o'z mock'ini ustiga qo'yadi
+    from src import vertex
+
+    def _blocked(*args, **kwargs):
+        raise RuntimeError("Real Vertex call blocked in tests")
+
+    monkeypatch.setattr(vertex, "chat_json", _blocked)
+
+
 def test_baseline_marks_seen(tmp_path: Path):
     """Initial baseline parse marks all entries as seen; no new events emitted."""
     db_path = tmp_path / "test.db"
@@ -370,6 +381,11 @@ def test_regression_defect_1_atomic_processing_jobs(tmp_path: Path, monkeypatch)
     from src.vendor_watch import runner
     # Mock load_sources to return empty list (simulating zero successful fetches)
     monkeypatch.setattr(runner, "load_sources", lambda: [])
+    monkeypatch.setattr(
+        enricher,
+        "enrich_event",
+        lambda ev, profile_text="", use_stub=False: enricher.stub_enrich(ev, profile_text),
+    )
 
     delivered = []
     monkeypatch.setattr(delivery, "deliver", lambda text, dry_run=False, conn=None, outbox_id=None: (delivered.append(text) or True, ""))

@@ -86,6 +86,7 @@ _PRERELEASE_KEYWORDS = (
 SEVERITY_ORDER = {
     "security": 100,
     "breaking": 90,
+    "account_change": 85,
     "deprecation": 80,
     "new_model": 70,
     "pricing": 60,

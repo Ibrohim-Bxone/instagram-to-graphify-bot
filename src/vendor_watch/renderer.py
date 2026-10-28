@@ -52,10 +52,16 @@ def render_high_priority_message(event: dict, enrichment: dict) -> str:
     vendor = event.get("vendor", "")
     product = event.get("product", "")
     triage_type = event.get("triage_type", "")
-    uz_title = enrichment.get("uz_title") or event.get("title", "")
-    uz_summary = enrichment.get("uz_summary", "")
-    uz_benefit = enrichment.get("uz_benefit", "")
-    uz_how = enrichment.get("uz_how_to_use", "")
+    if triage_type == "account_change":
+        uz_title = event.get("title") or enrichment.get("uz_title", "")
+        uz_summary = enrichment.get("uz_summary") or event.get("raw_content", "")
+        uz_benefit = enrichment.get("uz_benefit") or event.get("profile_impact", "")
+        uz_how = enrichment.get("uz_how_to_use") or event.get("command", "")
+    else:
+        uz_title = enrichment.get("uz_title") or event.get("title", "")
+        uz_summary = enrichment.get("uz_summary", "")
+        uz_benefit = enrichment.get("uz_benefit", "")
+        uz_how = enrichment.get("uz_how_to_use", "")
     overlap = enrichment.get("possible_overlap_with_custom_tool")
 
     clean_title = truncate_field(uz_title, 200)
@@ -165,6 +171,27 @@ def render_high_priority_message(event: dict, enrichment: dict) -> str:
         full_text = _build_message(clean_title, clean_summary, clean_benefit, clean_how)
 
     return full_text
+
+
+def render_account_change_message(event: dict, enrichment: dict | None = None) -> str:
+    """Render a tier-3 account probe change in the required Uzbek layout.
+
+    Layout:
+    🔔 <b>Sizning akkauntingizda: <model> paydo bo'ldi / yo'qoldi</b>
+    🏢 <i>Vendor — Product</i> [account_change]
+    📌 <b>Nima?</b> ...
+    🎯 <b>Sizga foydasi:</b> (profile.md stack impact)
+    💻 <b>Qanday ishlatish:</b> exact command
+    """
+    enr = enrichment or {
+        "uz_title": event.get("title", ""),
+        "uz_summary": event.get("raw_content") or event.get("summary", ""),
+        "uz_benefit": event.get("profile_impact", ""),
+        "uz_how_to_use": event.get("command", ""),
+        "possible_overlap_with_custom_tool": None,
+    }
+    return render_high_priority_message(event, enr)
+
 
 
 def render_merged_pages(items: list[tuple[dict, dict]]) -> list[tuple[str, list[tuple[dict, dict]]]]:

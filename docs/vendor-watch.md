@@ -75,3 +75,39 @@ Register-ScheduledTask -TaskName "VendorWatch_6Hours" -Action $action -Trigger $
 ```
 
 > **Eslatma:** Ushbu buyruqlar faqat ma'lumot va qo'llanma uchun keltirilgan, ruxsatsiz tizimga avtomatik ro'yxatdan o'tkazilmaydi.
+
+---
+
+## 5. Tier-3 Akkaunt Problari (Account & Tool Probes)
+
+Vendor Watch nafaqat vendorlarning rasmiy e'lonlarini (feed), balki foydalanuvchining shaxsiy hisoblari va lokal asboblarida nima amalda mavjud yoki o'zgarganini aniqlash uchun **Tier-3 Account Probes** mexanizmini o'z ichiga oladi.
+
+### 5.1. Statuslar semantikasi
+Tizim uchta holatni aniq farqlaydi:
+1. **Announced (E'lon qilingan):** Vendor Atom/RSS feed'larida ko'ringan yangilik.
+2. **Listed (Ro'yxatga olingan):** `agy models` CLI buyrug'i orqali qaytarilgan modellar ro'yxati.
+3. **Tested on this account (Akkauntda sinovdan o'tgan):** Shaxsiy Google Cloud Vertex AI loyihasida (`project-92b77c1d-c511-47ce-965`, `global`) `count_tokens` orqali tekshirilgan va HTTP 200 qaytargan modellar.
+
+### 5.2. Asosiy 4 ta prob (`probes.json` orqali boshqariladi):
+- `agy_models`: Antigravity (`agy models`) buyrug'i orqali olingan model ID'lar to'plami diffi. Yangi model qo'shilsa yoki o'chsa — darhol `high` prioriteti bilan xabar beriladi.
+- `agy_changelog`: `agy changelog` buyrug'idan yangi versiya yozuvlarini va bullet punktlarini ajratib oladi (`digest` prioriteti).
+- `cli_versions`: Mahalliy kompyuterda o'rnatilgan `codex`, `claude` va `agy` CLI versiyalarini GitHub'dagi eng so'nggi Atom relizlari bilan solishtiradi. Eskirgan asboblar haqida dayjest orqali xabar beradi.
+- `vertex_models`: Nomzod modellar ro'yxatini (boshlang'ich ro'yxat + yangiliklar oqimidan triage topgan modellar) Vertex AI'da bepul `count_tokens` so'rovi bilan tekshiradi. HTTP 200 — mavjud, HTTP 404 — mavjud emas.
+
+### 5.3. Xavfsiz xatolik semantikasi
+- **Bazaviy holat (Baseline):** Prob birinchi marta muvaffaqiyatli ishlaganda natija SQLite'dagi `probe_snapshots` jadvaliga bazaviy holat sifatida yoziladi; soxta qo'shildi/o'chirildi xabarlari chiqarilmaydi.
+- **Prob xatosi o'chirish emas (Probe failure ≠ removal):** Tarmoq uzilishi, timeout yoki avtorizatsiya (401/403/500) xatosi hech qachon model "o'chirildi" degan xulosaga olib kelmaydi. Xatolik qayd etiladi va keyingi tsiklda qayta uriniladi. Faqat toza HTTP 404 javobigina model yo'qolganini tasdiqlaydi.
+- **404 → 200 o'tishi:** Oldin 404 bergan model 200 bera boshlasa, foydalanuvchi hisobida model faollashgani aniqlanadi va darhol `high` prioriteti bilan xabar beriladi.
+
+### 5.4. O'zbekcha xabar formati va foydalanuvchi steki
+Har bir akkaunt o'zgarishi `renderer.py` orqali foydalanuvchi profili (`profile.md`) kontekstida yoritiladi:
+- Sarlavha: `🔔 Sizning akkauntingizda: <model> paydo bo'ldi / yo'qoldi`
+- `📌 Nima?`: Amalda nima yuz bergani (masalan, Vertex AI yoki agy ro'yxatida aniqlangani).
+- `🎯 Sizga foydasi:`: Foydalanuvchi steki (`profile.md`) uchun ma'nosi (masalan, `argon-ish.py` klipboard ko'prigi, `agy-run.py` konveyeri yoki `Antigravity Switcher` sozlamalariga ta'siri).
+- `💻 Qanday ishlatish:`: Modelni sinash yoki yangilash uchun aniq buyruq.
+
+### 5.5. CLI boshqaruvi
+- `python -m src.vendor_watch --probes-only`: Faqat hisob va asbob problarini yurgizish (tashqi feed'larni yuklamasdan).
+- `python -m src.vendor_watch --once`: Odatiy monitoring tsikli (tashqi feed'lar va prob tekshiruvlarini birgalikda o'z ichiga oladi).
+- `python -m src.vendor_watch --fixtures`: Problar uchun tayyor test ma'lumotlaridan (`CANNED_PROBE_OUTPUTS`) foydalanadi (tashqi tarmoq so'rovlarisiz).
+

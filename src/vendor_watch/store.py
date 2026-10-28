@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta
 import hashlib
+import json
 from pathlib import Path
 import sqlite3
 
@@ -144,6 +145,14 @@ def _init_schema(conn: sqlite3.Connection) -> None:
                 PRIMARY KEY (outbox_id, event_id, revision)
             );
 
+            CREATE TABLE IF NOT EXISTS probe_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                probe_name TEXT,
+                snapshot_json TEXT,
+                status TEXT DEFAULT 'success',
+                created_at TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_events_source ON events(source_id);
             CREATE INDEX IF NOT EXISTS idx_events_published ON events(published_at);
             CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status);
@@ -151,6 +160,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             CREATE INDEX IF NOT EXISTS idx_outbox_deliveries_status ON outbox_deliveries(status);
             CREATE INDEX IF NOT EXISTS idx_outbox_events_event ON outbox_events(event_id);
             CREATE INDEX IF NOT EXISTS idx_outbox_events_outbox ON outbox_events(outbox_id);
+            CREATE INDEX IF NOT EXISTS idx_probe_snapshots_name ON probe_snapshots(probe_name, id DESC);
             """
         )
 
@@ -809,3 +819,172 @@ def get_recent_events_for_clustering(
         d["links"] = [d["link"]] if d.get("link") else []
         rows.append(d)
     return rows
+
+
+def save_probe_snapshot(
+    conn: sqlite3.Connection,
+    probe_name: str,
+    snapshot: dict,
+    status: str = "success",
+) -> int:
+    """Save structured probe snapshot to SQLite."""
+    now_iso = datetime.now().isoformat()
+    snap_json = json.dumps(snapshot, ensure_ascii=False)
+    with conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO probe_snapshots (probe_name, snapshot_json, status, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (probe_name, snap_json, status, now_iso),
+        )
+        return cur.lastrowid
+
+
+def get_latest_probe_snapshot(
+    conn: sqlite3.Connection,
+    probe_name: str,
+    only_successful: bool = True,
+) -> dict | None:
+    """Retrieve the most recent probe snapshot, optionally filtering for success."""
+    cur = conn.cursor()
+    if only_successful:
+        cur.execute(
+            """
+            SELECT snapshot_json FROM probe_snapshots
+            WHERE probe_name = ? AND status = 'success'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (probe_name,),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT snapshot_json FROM probe_snapshots
+            WHERE probe_name = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (probe_name,),
+        )
+    row = cur.fetchone()
+    if row and row[0]:
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return None
+    return None
+
+
+def record_probe_events(
+    conn: sqlite3.Connection,
+    probe_events: list[dict],
+) -> list[dict]:
+    """Store probe-derived account change events in SQLite events table."""
+    now_iso = datetime.now().isoformat()
+    new_events = []
+    with conn:
+        for ev in probe_events:
+            event_id = ev["id"]
+            source_id = ev.get("source_id", "probe")
+            entry_id = ev.get("entry_id", event_id)
+            vendor = ev.get("vendor", "")
+            product = ev.get("product", "")
+            title = ev.get("title", "")
+            link = ev.get("link", "")
+            published_at = ev.get("published_at", now_iso)
+            raw_content = ev.get("raw_content", "")
+            triage_type = ev.get("triage_type", "account_change")
+            priority = ev.get("priority", "high")
+            chash = make_content_hash(title, raw_content)
+
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM events WHERE id = ?", (event_id,))
+            if cur.fetchone() is None:
+                conn.execute(
+                    """
+                    INSERT INTO events
+                    (id, source_id, entry_id, vendor, product, title, link, published_at,
+                     content_hash, revision, raw_content, triage_type, priority, status, first_seen_at, last_seen_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 'unseen', ?, ?)
+                    """,
+                    (
+                        event_id,
+                        source_id,
+                        entry_id,
+                        vendor,
+                        product,
+                        title,
+                        link,
+                        published_at,
+                        chash,
+                        raw_content,
+                        triage_type,
+                        priority,
+                        now_iso,
+                        now_iso,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO processing_jobs (event_id, status, created_at, updated_at)
+                    VALUES (?, 'pending', ?, ?)
+                    ON CONFLICT(event_id) DO UPDATE SET status = 'pending', updated_at = excluded.updated_at
+                    """,
+                    (event_id, now_iso, now_iso),
+                )
+                ev_copy = dict(ev)
+                ev_copy.setdefault("summary", raw_content)
+                ev_copy.setdefault("links", [link] if link else [])
+                ev_copy.setdefault("revision", 1)
+                new_events.append(ev_copy)
+    return new_events
+
+
+def get_latest_release_versions(conn: sqlite3.Connection) -> dict[str, str]:
+    """Extract highest semver release version for tracked CLI tools from events table."""
+    import re
+    from .probes import compare_semver
+
+    semver_re = re.compile(r"(\d+\.\d+\.\d+)")
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT source_id, title, link, entry_id
+        FROM events
+        WHERE source_id IN ('openai-codex', 'anthropic-claude-code', 'google-gemini-cli')
+        ORDER BY published_at DESC, id DESC
+        """
+    )
+    versions: dict[str, str] = {}
+    for row in cur.fetchall():
+        sid = row["source_id"]
+        text = f"{row['title']} {row['link']} {row['entry_id']}"
+        m = semver_re.search(text)
+        if m:
+            ver = m.group(1)
+            if sid not in versions or compare_semver(versions[sid], ver) < 0:
+                versions[sid] = ver
+    return versions
+
+
+def get_announced_model_candidates(conn: sqlite3.Connection) -> set[str]:
+    """Extract model identifiers mentioned in events for Vertex AI availability checks."""
+    import re
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT title, raw_content
+        FROM events
+        WHERE triage_type = 'new_model' OR raw_content LIKE '%gemini-%'
+        """
+    )
+    model_re = re.compile(r"\b(gemini-[a-zA-Z0-9.-]+)\b", re.IGNORECASE)
+    candidates = set()
+    for row in cur.fetchall():
+        for text in (row["title"], row["raw_content"]):
+            if text:
+                for match in model_re.findall(text):
+                    candidates.add(match.lower())
+    return candidates
+
