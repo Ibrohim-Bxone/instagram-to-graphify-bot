@@ -22,9 +22,11 @@ def get_connection(db_path: Path | str) -> sqlite3.Connection:
     return conn
 
 def collapse_outbox_duplicates(conn: sqlite3.Connection) -> list[dict]:
-    """Collapse duplicate pending/sent rows for the same event on startup.
+    """Migrate legacy outbox rows and collapse duplicate rows on startup.
 
     Keeps the earliest sent row or the newest pending row.
+    Merges recipient delivery records into the kept row (never deleting sent records).
+    Legacy group rows stay as sent history without re-linking members.
     Logs what was collapsed and returns list of collapsed records.
     """
     cur = conn.cursor()
@@ -37,10 +39,11 @@ def collapse_outbox_duplicates(conn: sqlite3.Connection) -> list[dict]:
     if "kind" in cols:
         conn.execute("UPDATE outbox SET kind = priority WHERE (kind IS NULL OR kind = '') AND priority != ''")
 
+    # Step 1: Assign stable keys to any outbox rows that lack one
     cur.execute(
         """
         SELECT id, event_id, priority, COALESCE(NULLIF(kind, ''), priority, '') AS kind_val,
-               status, attempts, created_at, revision, rendered_text
+               status, attempts, created_at, revision, rendered_text, key
         FROM outbox
         ORDER BY id ASC
         """
@@ -49,27 +52,59 @@ def collapse_outbox_duplicates(conn: sqlite3.Connection) -> list[dict]:
     if not rows:
         return []
 
+    # For legacy items of the same event_id, find the earliest row's revision so that
+    # duplicates of the same item share the same target_key
+    legacy_earliest_rev: dict[str, int] = {}
+    for r in rows:
+        if not r.get("key"):
+            eid = r.get("event_id") or ""
+            if eid and not eid.startswith("merged_high") and not eid.startswith("digest") and eid != "digest":
+                if eid not in legacy_earliest_rev:
+                    legacy_earliest_rev[eid] = r.get("revision") or 1
+
+    # Calculate target key and was_legacy in Python first (do NOT update DB yet)
+    for r in rows:
+        r["was_legacy"] = not bool(r.get("key"))
+        eid = r.get("event_id") or ""
+        prio = r.get("priority") or ""
+        if r.get("key"):
+            k = r["key"]
+        elif eid.startswith("merged_high"):
+            k = f"legacy:{eid}:{r['id']}"
+        elif eid == "digest":
+            date_str = (r.get("created_at") or "legacy")[:10]
+            k = f"digest:{date_str}"
+        elif eid.startswith("digest:"):
+            k = eid
+        elif eid.startswith("probe:"):
+            k = eid
+        else:
+            rev = legacy_earliest_rev.get(eid, r.get("revision") or 1)
+            if prio == "high":
+                k = f"high:{eid}:{rev}"
+            else:
+                k = f"{prio}:{eid}:{rev}"
+        r["target_key"] = k
+
+    # Step 2: Group duplicates
     groups: dict[str, list[dict]] = {}
     for r in rows:
-        eid = r["event_id"] or ""
-        kval = r["kind_val"] or ""
-        rev = r.get("revision") or 1
-        key = f"{eid}::{kval}::{rev}"
-        groups.setdefault(key, []).append(r)
+        eid = r.get("event_id") or ""
+        if eid.startswith("merged_high"):
+            continue
+        groups.setdefault(r["target_key"], []).append(r)
 
     collapsed_records = []
     with conn:
-        for key, group in groups.items():
+        for grp_key, group in groups.items():
             if len(group) <= 1:
                 continue
 
             sent_rows = [r for r in group if r["status"] == "sent"]
             if sent_rows:
-                # Keep earliest sent (smallest id / earliest created_at)
                 sent_rows.sort(key=lambda r: (r.get("created_at") or "", r["id"]))
                 kept = sent_rows[0]
             else:
-                # Keep newest pending/failed (largest id / latest created_at)
                 pending_rows = [r for r in group if r["status"] in ("pending", "failed")]
                 if pending_rows:
                     pending_rows.sort(key=lambda r: (r.get("created_at") or "", r["id"]), reverse=True)
@@ -81,6 +116,21 @@ def collapse_outbox_duplicates(conn: sqlite3.Connection) -> list[dict]:
             to_remove = [r for r in group if r["id"] != kept["id"]]
             for r in to_remove:
                 remove_id = r["id"]
+                # Merge deliveries: never delete a recipient's sent delivery record!
+                cur.execute("SELECT chat_id, status, attempts, last_attempt_at, error_message FROM outbox_deliveries WHERE outbox_id = ?", (remove_id,))
+                delivs = cur.fetchall()
+                for d in delivs:
+                    cid, d_st = d["chat_id"], d["status"]
+                    cur.execute("SELECT status FROM outbox_deliveries WHERE outbox_id = ? AND chat_id = ?", (kept["id"], cid))
+                    existing_d = cur.fetchone()
+                    if not existing_d:
+                        conn.execute("UPDATE outbox_deliveries SET outbox_id = ? WHERE outbox_id = ? AND chat_id = ?", (kept["id"], remove_id, cid))
+                    else:
+                        if d_st == "sent" and existing_d["status"] != "sent":
+                            conn.execute("UPDATE outbox_deliveries SET status = 'sent', error_message = '' WHERE outbox_id = ? AND chat_id = ?", (kept["id"], cid))
+                        conn.execute("DELETE FROM outbox_deliveries WHERE outbox_id = ? AND chat_id = ?", (remove_id, cid))
+
+                # Merge outbox_events into kept row
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO outbox_events (outbox_id, event_id, revision)
@@ -89,113 +139,45 @@ def collapse_outbox_duplicates(conn: sqlite3.Connection) -> list[dict]:
                     (kept["id"], remove_id),
                 )
                 conn.execute("DELETE FROM outbox_events WHERE outbox_id = ?", (remove_id,))
-                conn.execute("DELETE FROM outbox_deliveries WHERE outbox_id = ?", (remove_id,))
                 conn.execute("DELETE FROM outbox WHERE id = ?", (remove_id,))
                 collapsed_records.append(r)
 
             remove_ids = [r["id"] for r in to_remove]
             log.info(
-                "Collapsed %d duplicate outbox rows for event key '%s': kept id %d (status=%s), removed ids: %s",
-                len(to_remove), key, kept["id"], kept["status"], remove_ids,
+                "Collapsed %d duplicate outbox rows for group '%s': kept id %d (status=%s), removed ids: %s",
+                len(to_remove), grp_key, kept["id"], kept["status"], remove_ids,
             )
 
-        # Second pass: for specific events, if any row was sent, collapse any remaining pending rows for the same revision or older
-        cur.execute(
-            """
-            SELECT DISTINCT event_id, revision FROM outbox
-            WHERE status = 'sent' AND event_id NOT IN ('digest', 'merged_high')
-              AND event_id NOT LIKE 'digest:%' AND event_id NOT LIKE 'merged_high:%'
-            """
-        )
-        sent_events = cur.fetchall()
-        for seid, srev in sent_events:
-            s_revision = srev or 1
-            cur.execute(
-                """
-                SELECT id, event_id, priority, kind, status, created_at, revision, rendered_text
-                FROM outbox
-                WHERE event_id = ? AND revision <= ? AND status != 'sent'
-                """,
-                (seid, s_revision),
-            )
-            extra_pendings = [dict(r) for r in cur.fetchall()]
-            for ep in extra_pendings:
-                remove_id = ep["id"]
-                conn.execute("DELETE FROM outbox_events WHERE outbox_id = ?", (remove_id,))
-                conn.execute("DELETE FROM outbox_deliveries WHERE outbox_id = ?", (remove_id,))
-                conn.execute("DELETE FROM outbox WHERE id = ?", (remove_id,))
-                collapsed_records.append(ep)
-                log.info(
-                    "Collapsed pending outbox row #%d for already-sent event '%s' (rev %d)",
-                    remove_id, seid, ep.get("revision", 1),
-                )
+        # Now update keys on ALL remaining rows that lack a key
+        removed_ids_set = {r["id"] for r in collapsed_records}
+        for r in rows:
+            if r["id"] not in removed_ids_set and (not r.get("key")):
+                conn.execute("UPDATE outbox SET key = ? WHERE id = ?", (r["target_key"], r["id"]))
+                r["key"] = r["target_key"]
 
-        cur.execute("PRAGMA index_info(idx_outbox_event_kind)")
-        idx_cols = [r[2] for r in cur.fetchall()]
-        if idx_cols and "revision" not in idx_cols:
-            conn.execute("DROP INDEX IF EXISTS idx_outbox_event_kind")
+        # Ensure no duplicate (event_id, revision) exist in outbox_events before unique index
         conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_event_kind ON outbox(event_id, kind, revision)"
+            """
+            DELETE FROM outbox_events
+            WHERE rowid NOT IN (
+                SELECT MIN(oe.rowid)
+                FROM outbox_events oe
+                JOIN outbox o ON o.id = oe.outbox_id
+                GROUP BY oe.event_id, oe.revision
+            )
+            """
         )
+
+        # Ensure indexes exist
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_event_kind ON outbox(event_id, kind)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_key ON outbox(key)")
 
     return collapsed_records
 
 
 def _init_schema(conn: sqlite3.Connection) -> None:
     with conn:
-        # Ensure existing events table has all expected columns before index creation
-        cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='events'")
-        if cur.fetchone():
-            cur.execute("PRAGMA table_info(events)")
-            cols = {row[1] for row in cur.fetchall()}
-            for col, col_type in [
-                ("source_id", "TEXT"),
-                ("entry_id", "TEXT"),
-                ("vendor", "TEXT"),
-                ("product", "TEXT"),
-                ("title", "TEXT"),
-                ("link", "TEXT"),
-                ("published_at", "TEXT"),
-                ("content_hash", "TEXT"),
-                ("revision", "INTEGER DEFAULT 1"),
-                ("raw_content", "TEXT"),
-                ("triage_type", "TEXT DEFAULT ''"),
-                ("priority", "TEXT DEFAULT ''"),
-                ("cluster_id", "TEXT DEFAULT ''"),
-                ("status", "TEXT DEFAULT 'unseen'"),
-                ("first_seen_at", "TEXT"),
-                ("last_seen_at", "TEXT"),
-            ]:
-                if col not in cols:
-                    try:
-                        conn.execute(f"ALTER TABLE events ADD COLUMN {col} {col_type}")
-                    except Exception:
-                        pass
-
-        # Ensure outbox table has revision and kind columns
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox'")
-        if cur.fetchone():
-            cur.execute("PRAGMA table_info(outbox)")
-            out_cols = {row[1] for row in cur.fetchall()}
-            if "revision" not in out_cols:
-                try:
-                    conn.execute("ALTER TABLE outbox ADD COLUMN revision INTEGER DEFAULT 1")
-                except Exception:
-                    pass
-            if "kind" not in out_cols:
-                try:
-                    conn.execute("ALTER TABLE outbox ADD COLUMN kind TEXT DEFAULT ''")
-                except Exception:
-                    pass
-            try:
-                conn.execute("UPDATE outbox SET kind = priority WHERE (kind IS NULL OR kind = '') AND priority != ''")
-            except Exception:
-                pass
-
-        # Collapse existing duplicates on startup before creating unique index
-        collapse_outbox_duplicates(conn)
-
+        # Step 1: Create every table first
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS sources_meta (
@@ -230,6 +212,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
 
             CREATE TABLE IF NOT EXISTS outbox (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT,
                 event_id TEXT,
                 priority TEXT,
                 rendered_text TEXT,
@@ -244,7 +227,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
 
             CREATE TABLE IF NOT EXISTS processing_jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id TEXT UNIQUE,
+                event_id TEXT,
+                revision INTEGER DEFAULT 1,
                 status TEXT DEFAULT 'pending',
                 attempts INTEGER DEFAULT 0,
                 created_at TEXT,
@@ -280,6 +264,18 @@ def _init_schema(conn: sqlite3.Connection) -> None:
                 PRIMARY KEY (outbox_id, event_id, revision)
             );
 
+            CREATE TABLE IF NOT EXISTS outbox_pages (
+                outbox_id INTEGER,
+                page_number INTEGER,
+                rendered_text TEXT,
+                status TEXT DEFAULT 'pending',
+                attempts INTEGER DEFAULT 0,
+                last_attempt_at TEXT DEFAULT '',
+                error_message TEXT DEFAULT '',
+                member_ids_json TEXT DEFAULT '[]',
+                PRIMARY KEY (outbox_id, page_number)
+            );
+
             CREATE TABLE IF NOT EXISTS probe_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 probe_name TEXT,
@@ -287,7 +283,111 @@ def _init_schema(conn: sqlite3.Connection) -> None:
                 status TEXT DEFAULT 'success',
                 created_at TEXT
             );
+            """
+        )
 
+        # Step 2: Ensure any upgraded columns exist on existing tables
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(events)")
+        cols = {row[1] for row in cur.fetchall()}
+        for col, col_type in [
+            ("source_id", "TEXT"),
+            ("entry_id", "TEXT"),
+            ("vendor", "TEXT"),
+            ("product", "TEXT"),
+            ("title", "TEXT"),
+            ("link", "TEXT"),
+            ("published_at", "TEXT"),
+            ("content_hash", "TEXT"),
+            ("revision", "INTEGER DEFAULT 1"),
+            ("raw_content", "TEXT"),
+            ("triage_type", "TEXT DEFAULT ''"),
+            ("priority", "TEXT DEFAULT ''"),
+            ("cluster_id", "TEXT DEFAULT ''"),
+            ("status", "TEXT DEFAULT 'unseen'"),
+            ("first_seen_at", "TEXT"),
+            ("last_seen_at", "TEXT"),
+        ]:
+            if col not in cols:
+                try:
+                    conn.execute(f"ALTER TABLE events ADD COLUMN {col} {col_type}")
+                except Exception:
+                    pass
+
+        cur.execute("PRAGMA table_info(outbox)")
+        out_cols = {row[1] for row in cur.fetchall()}
+        for col, col_type in [
+            ("key", "TEXT"),
+            ("revision", "INTEGER DEFAULT 1"),
+            ("kind", "TEXT DEFAULT ''"),
+        ]:
+            if col not in out_cols:
+                try:
+                    conn.execute(f"ALTER TABLE outbox ADD COLUMN {col} {col_type}")
+                except Exception:
+                    pass
+
+        cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='processing_jobs'")
+        pj_row = cur.fetchone()
+        if pj_row and "UNIQUE" in pj_row[0].upper():
+            conn.execute("ALTER TABLE processing_jobs RENAME TO processing_jobs_old")
+            conn.execute(
+                """
+                CREATE TABLE processing_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT,
+                    revision INTEGER DEFAULT 1,
+                    status TEXT DEFAULT 'pending',
+                    attempts INTEGER DEFAULT 0,
+                    created_at TEXT,
+                    updated_at TEXT
+                )
+                """
+            )
+            cur.execute("PRAGMA table_info(processing_jobs_old)")
+            old_cols = {r[1] for r in cur.fetchall()}
+            if "revision" in old_cols:
+                conn.execute(
+                    """
+                    INSERT INTO processing_jobs (id, event_id, revision, status, attempts, created_at, updated_at)
+                    SELECT id, event_id, revision, status, attempts, created_at, updated_at FROM processing_jobs_old
+                    """
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO processing_jobs (id, event_id, revision, status, attempts, created_at, updated_at)
+                    SELECT id, event_id, 1, status, attempts, created_at, updated_at FROM processing_jobs_old
+                    """
+                )
+            conn.execute("DROP TABLE processing_jobs_old")
+        else:
+            cur.execute("PRAGMA table_info(processing_jobs)")
+            pj_cols = {row[1] for row in cur.fetchall()}
+            if "revision" not in pj_cols:
+                try:
+                    conn.execute("ALTER TABLE processing_jobs ADD COLUMN revision INTEGER DEFAULT 1")
+                except Exception:
+                    pass
+
+        cur.execute("PRAGMA table_info(outbox_pages)")
+        op_cols = {row[1] for row in cur.fetchall()}
+        if "member_ids_json" not in op_cols:
+            try:
+                conn.execute("ALTER TABLE outbox_pages ADD COLUMN member_ids_json TEXT DEFAULT '[]'")
+            except Exception:
+                pass
+
+        # Step 3: Migrate legacy rows and collapse duplicates
+        collapse_outbox_duplicates(conn)
+
+        # Step 4: Startup recovery: mark any outbox rows left in 'sending' as 'ambiguous'
+        conn.execute("UPDATE outbox SET status = 'ambiguous' WHERE status = 'sending'")
+        conn.execute("UPDATE outbox_pages SET status = 'ambiguous' WHERE status = 'sending'")
+
+        # Step 5: Create all indexes
+        conn.executescript(
+            """
             CREATE INDEX IF NOT EXISTS idx_events_source ON events(source_id);
             CREATE INDEX IF NOT EXISTS idx_events_published ON events(published_at);
             CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status);
@@ -296,7 +396,9 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             CREATE INDEX IF NOT EXISTS idx_outbox_events_event ON outbox_events(event_id);
             CREATE INDEX IF NOT EXISTS idx_outbox_events_outbox ON outbox_events(outbox_id);
             CREATE INDEX IF NOT EXISTS idx_probe_snapshots_name ON probe_snapshots(probe_name, id DESC);
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_event_kind ON outbox(event_id, kind, revision);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_key ON outbox(key);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_events_member ON outbox_events(event_id, revision);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_processing_jobs_event_rev ON processing_jobs(event_id, revision);
             """
         )
 
@@ -485,9 +587,9 @@ def record_unseen_entries(
                 )
                 conn.execute(
                     """
-                    INSERT INTO processing_jobs (event_id, status, created_at, updated_at)
-                    VALUES (?, 'pending', ?, ?)
-                    ON CONFLICT(event_id) DO UPDATE SET status = 'pending', updated_at = excluded.updated_at
+                    INSERT INTO processing_jobs (event_id, revision, status, created_at, updated_at)
+                    VALUES (?, 1, 'pending', ?, ?)
+                    ON CONFLICT(event_id, revision) DO UPDATE SET status = 'pending', updated_at = excluded.updated_at
                     """,
                     (event_id, now_iso, now_iso),
                 )
@@ -533,11 +635,11 @@ def record_unseen_entries(
                     )
                     conn.execute(
                         """
-                        INSERT INTO processing_jobs (event_id, status, created_at, updated_at)
-                        VALUES (?, 'pending', ?, ?)
-                        ON CONFLICT(event_id) DO UPDATE SET status = 'pending', updated_at = excluded.updated_at
+                        INSERT INTO processing_jobs (event_id, revision, status, created_at, updated_at)
+                        VALUES (?, ?, 'pending', ?, ?)
+                        ON CONFLICT(event_id, revision) DO UPDATE SET status = 'pending', updated_at = excluded.updated_at
                         """,
-                        (event_id, now_iso, now_iso),
+                        (event_id, new_rev, now_iso, now_iso),
                     )
                     conn.execute(
                         """
@@ -610,52 +712,109 @@ def add_to_outbox(
     rendered_text: str,
     revision: int = 1,
     kind: str | None = None,
+    key: str | None = None,
+    pages: list | None = None,
+    member_events: list[dict] | None = None,
 ) -> int:
     target_kind = kind if kind is not None else priority
     now_iso = datetime.now().isoformat()
+    if not key:
+        if priority == "high":
+            if event_id.startswith("probe:"):
+                key = event_id
+            elif event_id.startswith("high:"):
+                key = event_id
+            else:
+                key = f"high:{event_id}:{revision}"
+        elif priority == "digest" or target_kind == "digest":
+            if event_id.startswith("digest:"):
+                key = event_id
+            else:
+                key = f"digest:{event_id}"
+        elif event_id.startswith("probe:"):
+            key = event_id
+        else:
+            key = f"{priority}:{event_id}:{revision}"
+
     with conn:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, status, revision FROM outbox
-            WHERE event_id = ? AND (kind = ? OR priority = ?) AND revision = ?
-            ORDER BY id ASC LIMIT 1
-            """,
-            (event_id, target_kind, target_kind, revision),
-        )
-        existing = cur.fetchone()
-        if existing:
-            out_id = existing["id"]
-            if existing["status"] in ("pending", "failed"):
-                conn.execute(
-                    """
-                    UPDATE outbox
-                    SET rendered_text = ?, priority = ?, kind = ?
-                    WHERE id = ?
-                    """,
-                    (rendered_text, priority, target_kind, out_id),
-                )
-            return out_id
-
-        # Insert new outbox row with conflict resolution per (event_id, kind, revision)
-        cur.execute(
-            """
-            INSERT INTO outbox (event_id, priority, kind, rendered_text, status, attempts, created_at, revision)
-            VALUES (?, ?, ?, ?, 'pending', 0, ?, ?)
-            ON CONFLICT(event_id, kind, revision) DO UPDATE SET
-                rendered_text = CASE WHEN outbox.status != 'sent' THEN excluded.rendered_text ELSE outbox.rendered_text END,
+            INSERT INTO outbox (key, event_id, priority, kind, rendered_text, status, attempts, created_at, revision)
+            VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                rendered_text = CASE WHEN outbox.status NOT IN ('sent', 'sending') THEN excluded.rendered_text ELSE outbox.rendered_text END,
                 priority = excluded.priority
             """,
-            (event_id, priority, target_kind, rendered_text, now_iso, revision),
+            (key, event_id, priority, target_kind, rendered_text, now_iso, revision),
         )
         if cur.lastrowid:
-            return cur.lastrowid
-        cur.execute(
-            "SELECT id FROM outbox WHERE event_id = ? AND (kind = ? OR priority = ?) AND revision = ? ORDER BY id ASC LIMIT 1",
-            (event_id, target_kind, target_kind, revision),
-        )
-        row = cur.fetchone()
-        return row[0]
+            out_id = cur.lastrowid
+        else:
+            cur.execute("SELECT id FROM outbox WHERE key = ?", (key,))
+            row = cur.fetchone()
+            out_id = row[0] if row else 0
+
+        if pages:
+            for p_idx, page_item in enumerate(pages, 1):
+                if isinstance(page_item, tuple):
+                    p_msg = page_item[0]
+                    p_mids = [it[0]["id"] for it in page_item[1] if it[0].get("id")]
+                else:
+                    p_msg = str(page_item)
+                    p_mids = []
+                mids_json = json.dumps(p_mids)
+                conn.execute(
+                    """
+                    INSERT INTO outbox_pages (outbox_id, page_number, rendered_text, status, member_ids_json)
+                    VALUES (?, ?, ?, 'pending', ?)
+                    ON CONFLICT(outbox_id, page_number) DO UPDATE SET
+                        rendered_text = CASE WHEN outbox_pages.status NOT IN ('sent', 'sending') THEN excluded.rendered_text ELSE outbox_pages.rendered_text END,
+                        member_ids_json = excluded.member_ids_json
+                    """,
+                    (out_id, p_idx, p_msg, mids_json),
+                )
+
+        if member_events:
+            for ev in member_events:
+                mid = ev["id"]
+                mrev = ev.get("revision", 1)
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO outbox_events (outbox_id, event_id, revision)
+                    VALUES (?, ?, ?)
+                    """,
+                    (out_id, mid, mrev),
+                )
+
+        return out_id
+
+
+def add_digest_to_outbox(
+    conn: sqlite3.Connection,
+    key: str,
+    rendered_text: str,
+    pages: list[tuple[str, list[tuple[dict, dict]]]],
+    member_events: list[dict],
+) -> int:
+    return add_to_outbox(
+        conn,
+        event_id=key,
+        priority="digest",
+        rendered_text=rendered_text,
+        revision=1,
+        kind="digest",
+        key=key,
+        pages=pages,
+        member_events=member_events,
+    )
+
+
+def get_outbox_by_key(conn: sqlite3.Connection, key: str) -> dict | None:
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM outbox WHERE key = ? LIMIT 1", (key,))
+    row = cur.fetchone()
+    return dict(row) if row else None
 
 
 def is_event_already_sent(
@@ -664,13 +823,18 @@ def is_event_already_sent(
     revision: int | None = None,
     content_hash: str | None = None,
 ) -> bool:
-    """Check if an event was already successfully sent in any previous run."""
+    """Check if an exact (event_id, revision) was already successfully sent."""
     cur = conn.cursor()
     # 1. Outbox entry with status 'sent'
     if revision is not None:
+        key = f"high:{event_id}:{revision}"
         cur.execute(
-            "SELECT 1 FROM outbox WHERE event_id = ? AND revision >= ? AND status = 'sent' LIMIT 1",
-            (event_id, revision),
+            """
+            SELECT 1 FROM outbox
+            WHERE (key = ? OR (event_id = ? AND revision = ?)) AND status = 'sent'
+            LIMIT 1
+            """,
+            (key, event_id, revision),
         )
     else:
         cur.execute(
@@ -686,7 +850,7 @@ def is_event_already_sent(
             """
             SELECT 1 FROM outbox_events oe
             JOIN outbox o ON o.id = oe.outbox_id
-            WHERE oe.event_id = ? AND oe.revision >= ? AND o.status = 'sent'
+            WHERE oe.event_id = ? AND oe.revision = ? AND o.status = 'sent'
             LIMIT 1
             """,
             (event_id, revision),
@@ -714,7 +878,7 @@ def is_event_already_sent(
             return True
     elif revision is not None:
         cur.execute(
-            "SELECT 1 FROM events WHERE id = ? AND revision >= ? AND status = 'sent' LIMIT 1",
+            "SELECT 1 FROM events WHERE id = ? AND revision = ? AND status = 'sent' LIMIT 1",
             (event_id, revision),
         )
         if cur.fetchone():
@@ -737,6 +901,18 @@ def is_event_already_sent(
             return True
 
     return False
+
+
+def is_event_revision_reserved(
+    conn: sqlite3.Connection, event_id: str, revision: int = 1
+) -> bool:
+    """Check if an (event_id, revision) pair is already reserved in outbox_events."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM outbox_events WHERE event_id = ? AND revision = ? LIMIT 1",
+        (event_id, revision),
+    )
+    return cur.fetchone() is not None
 
 
 def is_raw_or_unenriched_text(rendered_text: str) -> bool:
@@ -763,28 +939,39 @@ def downgrade_outbox_to_digest(conn: sqlite3.Connection, outbox_id: int) -> None
         )
 
 
-def increment_processing_job_attempts(conn: sqlite3.Connection, event_id: str) -> int:
+def increment_enrichment_attempts(
+    conn: sqlite3.Connection, event_id: str, revision: int = 1
+) -> int:
+    """Persist and increment enrichment failure attempts per (event_id, revision)."""
     now_iso = datetime.now().isoformat()
     with conn:
         conn.execute(
             """
-            INSERT INTO processing_jobs (event_id, status, attempts, created_at, updated_at)
-            VALUES (?, 'pending', 1, ?, ?)
-            ON CONFLICT(event_id) DO UPDATE SET attempts = processing_jobs.attempts + 1, updated_at = excluded.updated_at
+            INSERT INTO processing_jobs (event_id, revision, status, attempts, created_at, updated_at)
+            VALUES (?, ?, 'pending', 1, ?, ?)
+            ON CONFLICT(event_id, revision) DO UPDATE SET attempts = processing_jobs.attempts + 1, updated_at = excluded.updated_at
             """,
-            (event_id, now_iso, now_iso),
+            (event_id, revision, now_iso, now_iso),
         )
         cur = conn.cursor()
-        cur.execute("SELECT attempts FROM processing_jobs WHERE event_id = ?", (event_id,))
+        cur.execute(
+            "SELECT attempts FROM processing_jobs WHERE event_id = ? AND revision = ?",
+            (event_id, revision),
+        )
         row = cur.fetchone()
         return row[0] if row else 1
 
+
+def increment_processing_job_attempts(
+    conn: sqlite3.Connection, event_id: str, revision: int = 1
+) -> int:
+    return increment_enrichment_attempts(conn, event_id, revision)
 
 
 def link_outbox_events(
     conn: sqlite3.Connection, outbox_id: int, events: list[dict]
 ) -> None:
-    """Link all member events and their revisions to an outbox entry."""
+    """Link member events and their revisions to an outbox entry."""
     with conn:
         for ev in events:
             member_ids = ev.get("member_ids") or [ev["id"]]
@@ -854,6 +1041,13 @@ def update_outbox_status(
 ) -> None:
     now_iso = datetime.now().isoformat()
     with conn:
+        if status == "sending":
+            conn.execute(
+                "UPDATE outbox SET status = 'sending', last_attempt_at = ? WHERE id = ?",
+                (now_iso, outbox_id),
+            )
+            return
+
         conn.execute(
             """
             UPDATE outbox
@@ -862,41 +1056,168 @@ def update_outbox_status(
             """,
             (status, now_iso, error_message, outbox_id),
         )
-        # Update notification status and processing jobs for all linked member events
         cur = conn.cursor()
-        cur.execute("SELECT DISTINCT event_id FROM outbox_events WHERE outbox_id = ?", (outbox_id,))
-        linked_mids = [r[0] for r in cur.fetchall()]
-        if not linked_mids:
-            cur.execute("SELECT event_id FROM outbox WHERE id = ?", (outbox_id,))
-            row = cur.fetchone()
-            if row and row[0] not in ("digest", "merged_high") and not row[0].startswith("digest:") and not row[0].startswith("merged_high:"):
-                linked_mids = [row[0]]
+        cur.execute("SELECT COUNT(*) FROM outbox_pages WHERE outbox_id = ?", (outbox_id,))
+        has_pages = (cur.fetchone()[0] > 0)
+        if not has_pages:
+            cur.execute("SELECT DISTINCT event_id, revision FROM outbox_events WHERE outbox_id = ?", (outbox_id,))
+            linked = cur.fetchall()
+            if not linked:
+                cur.execute("SELECT event_id, revision FROM outbox WHERE id = ?", (outbox_id,))
+                row = cur.fetchone()
+                if row and not row[0].startswith("digest:") and not row[0].startswith("legacy:") and row[0] != "digest":
+                    linked = [(row[0], row[1] or 1)]
 
-        for mid in linked_mids:
-            conn.execute(
-                """
-                INSERT INTO event_notifications (event_id, status, notified_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(event_id) DO UPDATE SET status = excluded.status, notified_at = excluded.notified_at
-                """,
-                (mid, status, now_iso),
-            )
-            conn.execute(
-                "UPDATE events SET status = ? WHERE id = ?",
-                (status, mid),
-            )
+            for mid, mrev in linked:
+                conn.execute(
+                    """
+                    INSERT INTO event_notifications (event_id, status, notified_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(event_id) DO UPDATE SET status = excluded.status, notified_at = excluded.notified_at
+                    """,
+                    (mid, status, now_iso),
+                )
+                conn.execute(
+                    "UPDATE events SET status = ? WHERE id = ?",
+                    (status, mid),
+                )
 
 
+def get_unsent_outbox_pages(conn: sqlite3.Connection, outbox_id: int) -> list[dict]:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM outbox_pages
+        WHERE outbox_id = ? AND status != 'sent'
+        ORDER BY page_number ASC
+        """,
+        (outbox_id,),
+    )
+    return [dict(r) for r in cur.fetchall()]
 
-def count_today_high_priority(conn: sqlite3.Connection) -> int:
-    today_start = datetime.now().date().isoformat()
+
+def mark_outbox_page_status(
+    conn: sqlite3.Connection, outbox_id: int, page_number: int, status: str
+) -> None:
+    now_iso = datetime.now().isoformat()
+    with conn:
+        conn.execute(
+            """
+            UPDATE outbox_pages
+            SET status = ?, last_attempt_at = ?
+            WHERE outbox_id = ? AND page_number = ?
+            """,
+            (status, now_iso, outbox_id, page_number),
+        )
+
+
+def mark_outbox_page_sent(
+    conn: sqlite3.Connection, outbox_id: int, page_number: int
+) -> None:
+    now_iso = datetime.now().isoformat()
+    with conn:
+        conn.execute(
+            """
+            UPDATE outbox_pages
+            SET status = 'sent', last_attempt_at = ?, error_message = ''
+            WHERE outbox_id = ? AND page_number = ?
+            """,
+            (now_iso, outbox_id, page_number),
+        )
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT member_ids_json FROM outbox_pages WHERE outbox_id = ? AND page_number = ?",
+            (outbox_id, page_number),
+        )
+        row = cur.fetchone()
+        if row and row[0]:
+            try:
+                mids = json.loads(row[0])
+                for mid in mids:
+                    conn.execute(
+                        """
+                        INSERT INTO event_notifications (event_id, status, notified_at)
+                        VALUES (?, 'sent', ?)
+                        ON CONFLICT(event_id) DO UPDATE SET status = 'sent', notified_at = excluded.notified_at
+                        """,
+                        (mid, now_iso),
+                    )
+                    conn.execute("UPDATE events SET status = 'sent' WHERE id = ?", (mid,))
+            except Exception:
+                pass
+
+
+def mark_outbox_page_failed(
+    conn: sqlite3.Connection, outbox_id: int, page_number: int, error: str = ""
+) -> None:
+    now_iso = datetime.now().isoformat()
+    with conn:
+        conn.execute(
+            """
+            UPDATE outbox_pages
+            SET status = 'failed', attempts = attempts + 1, last_attempt_at = ?, error_message = ?
+            WHERE outbox_id = ? AND page_number = ?
+            """,
+            (now_iso, error, outbox_id, page_number),
+        )
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT member_ids_json FROM outbox_pages WHERE outbox_id = ? AND page_number = ?",
+            (outbox_id, page_number),
+        )
+        row = cur.fetchone()
+        if row and row[0]:
+            try:
+                mids = json.loads(row[0])
+                for mid in mids:
+                    conn.execute(
+                        """
+                        INSERT INTO event_notifications (event_id, status, notified_at)
+                        VALUES (?, 'failed', ?)
+                        ON CONFLICT(event_id) DO UPDATE SET status = 'failed', notified_at = excluded.notified_at
+                        """,
+                        (mid, now_iso),
+                    )
+                    conn.execute("UPDATE events SET status = 'failed' WHERE id = ?", (mid,))
+            except Exception:
+                pass
+
+
+def are_all_outbox_pages_sent(conn: sqlite3.Connection, outbox_id: int) -> bool:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) FROM outbox_pages WHERE outbox_id = ? AND status != 'sent'",
+        (outbox_id,),
+    )
+    row = cur.fetchone()
+    return (row[0] == 0) if row else True
+
+
+def mark_sending_outbox_ambiguous(conn: sqlite3.Connection) -> int:
+    with conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE outbox SET status = 'ambiguous' WHERE status = 'sending'")
+        cnt = cur.rowcount
+        conn.execute("UPDATE outbox_pages SET status = 'ambiguous' WHERE status = 'sending'")
+        return cnt
+
+
+def count_ambiguous_outbox(conn: sqlite3.Connection) -> int:
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM outbox WHERE status = 'ambiguous'")
+    row = cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+def count_today_high_priority(conn: sqlite3.Connection, today_date: str | None = None) -> int:
+    today_start = today_date or datetime.now().date().isoformat()
     cur = conn.cursor()
     cur.execute(
         """
         SELECT COUNT(*) AS cnt FROM outbox
-        WHERE priority = 'high' AND status = 'sent' AND created_at >= ?
+        WHERE priority = 'high' AND status = 'sent' AND (created_at >= ? OR key LIKE ?)
         """,
-        (today_start,),
+        (today_start, f"%:{today_start}%"),
     )
     row = cur.fetchone()
     return int(row["cnt"]) if row else 0
@@ -907,7 +1228,8 @@ def get_pending_processing_jobs(conn: sqlite3.Connection) -> list[dict]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT pj.id AS job_id, pj.event_id AS event_id, pj.status AS job_status, pj.attempts AS job_attempts,
+        SELECT pj.id AS job_id, pj.event_id AS event_id, pj.revision AS job_revision,
+               pj.status AS job_status, pj.attempts AS job_attempts,
                e.*
         FROM processing_jobs pj
         JOIN events e ON pj.event_id = e.id
@@ -920,36 +1242,60 @@ def get_pending_processing_jobs(conn: sqlite3.Connection) -> list[dict]:
         d = dict(row)
         d["summary"] = d.get("summary") or d.get("raw_content") or ""
         d["links"] = [d["link"]] if d.get("link") else []
+        if d.get("job_revision") is not None:
+            d["revision"] = d["job_revision"]
         results.append(d)
     return results
 
 
-def mark_processing_job_done(conn: sqlite3.Connection, event_id: str) -> None:
-    now_iso = datetime.now().isoformat()
-    with conn:
-        conn.execute(
-            """
-            UPDATE processing_jobs
-            SET status = 'completed', updated_at = ?
-            WHERE event_id = ?
-            """,
-            (now_iso, event_id),
-        )
-
-
-def mark_processing_job_failed(
-    conn: sqlite3.Connection, event_id: str, error_message: str = ""
+def mark_processing_job_done(
+    conn: sqlite3.Connection, event_id: str, revision: int | None = None
 ) -> None:
     now_iso = datetime.now().isoformat()
     with conn:
-        conn.execute(
-            """
-            UPDATE processing_jobs
-            SET status = 'failed', attempts = attempts + 1, updated_at = ?
-            WHERE event_id = ?
-            """,
-            (now_iso, event_id),
-        )
+        if revision is not None:
+            conn.execute(
+                """
+                UPDATE processing_jobs
+                SET status = 'completed', updated_at = ?
+                WHERE event_id = ? AND revision <= ?
+                """,
+                (now_iso, event_id, revision),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE processing_jobs
+                SET status = 'completed', updated_at = ?
+                WHERE event_id = ?
+                """,
+                (now_iso, event_id),
+            )
+
+
+def mark_processing_job_failed(
+    conn: sqlite3.Connection, event_id: str, error_message: str = "", revision: int | None = None
+) -> None:
+    now_iso = datetime.now().isoformat()
+    with conn:
+        if revision is not None:
+            conn.execute(
+                """
+                UPDATE processing_jobs
+                SET status = 'failed', attempts = attempts + 1, updated_at = ?
+                WHERE event_id = ? AND revision = ?
+                """,
+                (now_iso, event_id, revision),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE processing_jobs
+                SET status = 'failed', attempts = attempts + 1, updated_at = ?
+                WHERE event_id = ?
+                """,
+                (now_iso, event_id),
+            )
 
 
 def get_app_state(conn: sqlite3.Connection, key: str, default: str = "") -> str:
@@ -1040,14 +1386,14 @@ def record_delivery_attempt(
             (out_status, now_iso, all_sent, error, outbox_id),
         )
         if all_sent:
-            cur.execute("SELECT DISTINCT event_id FROM outbox_events WHERE outbox_id = ?", (outbox_id,))
-            linked_mids = [r[0] for r in cur.fetchall()]
-            if not linked_mids:
-                cur.execute("SELECT event_id FROM outbox WHERE id = ?", (outbox_id,))
+            cur.execute("SELECT DISTINCT event_id, revision FROM outbox_events WHERE outbox_id = ?", (outbox_id,))
+            linked = cur.fetchall()
+            if not linked:
+                cur.execute("SELECT event_id, revision FROM outbox WHERE id = ?", (outbox_id,))
                 o_row = cur.fetchone()
-                if o_row and o_row[0] not in ("digest", "merged_high") and not o_row[0].startswith("digest:") and not o_row[0].startswith("merged_high:"):
-                    linked_mids = [o_row[0]]
-            for mid in linked_mids:
+                if o_row and not o_row[0].startswith("digest:") and not o_row[0].startswith("legacy:") and o_row[0] != "digest":
+                    linked = [(o_row[0], o_row[1] or 1)]
+            for mid, mrev in linked:
                 conn.execute(
                     """
                     INSERT INTO event_notifications (event_id, status, notified_at)
@@ -1083,17 +1429,18 @@ def get_outbox_for_event(
 ) -> dict | None:
     cur = conn.cursor()
     if revision is not None:
+        key = f"high:{event_id}:{revision}"
         cur.execute(
-            "SELECT * FROM outbox WHERE event_id = ? AND revision = ? AND status = 'sent' ORDER BY id ASC LIMIT 1",
-            (event_id, revision),
+            "SELECT * FROM outbox WHERE (key = ? OR (event_id = ? AND revision = ?)) AND status = 'sent' ORDER BY id ASC LIMIT 1",
+            (key, event_id, revision),
         )
         row = cur.fetchone()
         if row:
             return dict(row)
 
         cur.execute(
-            "SELECT * FROM outbox WHERE event_id = ? AND revision = ? ORDER BY id DESC LIMIT 1",
-            (event_id, revision),
+            "SELECT * FROM outbox WHERE (key = ? OR (event_id = ? AND revision = ?)) ORDER BY id DESC LIMIT 1",
+            (key, event_id, revision),
         )
         row = cur.fetchone()
         return dict(row) if row else None
@@ -1248,9 +1595,9 @@ def record_probe_events(
                 )
                 conn.execute(
                     """
-                    INSERT INTO processing_jobs (event_id, status, created_at, updated_at)
-                    VALUES (?, 'pending', ?, ?)
-                    ON CONFLICT(event_id) DO UPDATE SET status = 'pending', updated_at = excluded.updated_at
+                    INSERT INTO processing_jobs (event_id, revision, status, created_at, updated_at)
+                    VALUES (?, 1, 'pending', ?, ?)
+                    ON CONFLICT(event_id, revision) DO UPDATE SET status = 'pending', updated_at = excluded.updated_at
                     """,
                     (event_id, now_iso, now_iso),
                 )

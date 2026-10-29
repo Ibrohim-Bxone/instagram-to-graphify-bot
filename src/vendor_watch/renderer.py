@@ -272,15 +272,29 @@ def render_merged_high_priority(items: list[tuple[dict, dict]]) -> list[str]:
     return [page[0] for page in render_merged_pages(items)]
 
 
-def render_digest_pages(items: list[tuple[dict, dict]]) -> list[tuple[str, list[tuple[dict, dict]]]]:
+def render_digest_pages(
+    items: list[tuple[dict, dict]],
+    ambiguous_count: int = 0,
+) -> list[tuple[str, list[tuple[dict, dict]]]]:
     """Render regular updates into one or more digest messages <= 3900 chars.
 
     Returns a list of tuples: (rendered_message, list_of_items_in_this_page).
     """
     if not items:
+        if ambiguous_count > 0:
+            msg = "📋 <b>Vendor Updates — Kunlik Dayjest</b>\n" \
+                  f"⚠️ Eslatma: {ambiguous_count} ta yetkazib berish holati noaniq (ambiguous).\n" \
+                  "Bugungi yangi relizlar mavjud emas.\n"
+            return [(msg, [])]
         return []
 
+    ambiguous_line = (
+        f"⚠️ Eslatma: {ambiguous_count} ta yetkazib berish holati noaniq (ambiguous).\n"
+        if ambiguous_count > 0
+        else ""
+    )
     header = "📋 <b>Vendor Updates — Kunlik Dayjest</b>\n" \
+             f"{ambiguous_line}" \
              "So'nggi tizimli yangilanishlar va kutubxona relizlari:\n\n"
 
     pages: list[tuple[str, list[tuple[dict, dict]]]] = []
@@ -339,5 +353,5 @@ def render_digest_pages(items: list[tuple[dict, dict]]) -> list[tuple[str, list[
     return [(m, itms) for m, itms in pages if m.strip()]
 
 
-def render_digest_messages(items: list[tuple[dict, dict]]) -> list[str]:
-    return [page[0] for page in render_digest_pages(items)]
+def render_digest_messages(items: list[tuple[dict, dict]], ambiguous_count: int = 0) -> list[str]:
+    return [page[0] for page in render_digest_pages(items, ambiguous_count=ambiguous_count)]

@@ -20,20 +20,35 @@ def load_sources() -> list[dict]:
 
 
 def _mark_all_done(conn: sqlite3.Connection, ev: dict) -> None:
+    rev = ev.get("revision", 1)
     member_ids = ev.get("member_ids") or [ev["id"]]
     for mid in member_ids:
-        store.mark_processing_job_done(conn, mid)
+        store.mark_processing_job_done(conn, mid, revision=rev)
 
 
 def _mark_outbox_done(conn: sqlite3.Connection, outbox_id: int, event_id: str) -> None:
     cur = conn.cursor()
-    cur.execute("SELECT DISTINCT event_id FROM outbox_events WHERE outbox_id = ?", (outbox_id,))
-    linked_mids = [r[0] for r in cur.fetchall()]
-    if not linked_mids:
-        if event_id not in ("digest", "merged_high") and not event_id.startswith("digest:") and not event_id.startswith("merged_high:"):
-            linked_mids = [event_id]
-    for mid in linked_mids:
-        store.mark_processing_job_done(conn, mid)
+    cur.execute("SELECT DISTINCT event_id, revision FROM outbox_events WHERE outbox_id = ?", (outbox_id,))
+    rows = cur.fetchall()
+    if rows:
+        for mid, rev in rows:
+            store.mark_processing_job_done(conn, mid, revision=rev)
+    else:
+        if event_id.startswith("high:"):
+            rem = event_id.removeprefix("high:")
+            if ":" in rem:
+                mid, rev_str = rem.rsplit(":", 1)
+                try:
+                    rev = int(rev_str)
+                except ValueError:
+                    mid = rem
+                    rev = 1
+            else:
+                mid = rem
+                rev = 1
+            store.mark_processing_job_done(conn, mid, revision=rev)
+        elif not event_id.startswith("digest") and not event_id.startswith("merged_high"):
+            store.mark_processing_job_done(conn, event_id, revision=1)
 
 
 def _mark_all_notified(conn: sqlite3.Connection, ev: dict, status: str = "sent") -> None:
@@ -88,6 +103,9 @@ def run_cycle(
             / "vendor_watch"
         )
 
+    # 0. Startup recovery: mark any outbox rows left in 'sending' as 'ambiguous'
+    store.mark_sending_outbox_ambiguous(conn)
+
     # 1. Retry pending or previously failed outbox items
     pending_outbox = store.get_pending_outbox(conn)
     for out_item in pending_outbox:
@@ -99,36 +117,89 @@ def run_cycle(
         is_digest = (out_item["priority"] == "digest")
         should_send = (out_item["priority"] == "high") or digest_mode or (is_digest and is_daily_due)
         if should_send:
-            success, err = delivery.deliver(
-                out_item["rendered_text"],
-                dry_run=dry_run,
-                conn=conn,
-                outbox_id=out_item["id"],
-            )
-            store.update_outbox_status(
-                conn,
-                out_item["id"],
-                "sent" if success else "failed",
-                error_message=err,
-            )
-            if success:
-                _mark_outbox_done(conn, out_item["id"], out_item["event_id"])
-                if is_digest and not dry_run:
-                    ev_id = out_item.get("event_id", "")
-                    out_date = None
-                    if ev_id.startswith("digest:"):
-                        out_date = ev_id.split(":")[1]
-                    if out_date and out_date < today_str:
-                        store.set_app_state(conn, "last_digest_date", out_date)
+            unsent_pages = store.get_unsent_outbox_pages(conn, out_item["id"])
+            if unsent_pages:
+                all_pages_sent = True
+                last_err = ""
+                for pg in unsent_pages:
+                    p_num = pg["page_number"]
+                    p_text = pg["rendered_text"]
+                    try:
+                        p_success, p_err = delivery.deliver(
+                            p_text,
+                            dry_run=dry_run,
+                            conn=conn,
+                            outbox_id=out_item["id"],
+                            page_number=p_num,
+                        )
+                    except TypeError:
+                        p_success, p_err = delivery.deliver(
+                            p_text,
+                            dry_run=dry_run,
+                            conn=conn,
+                            outbox_id=out_item["id"],
+                        )
+                    if p_success:
+                        store.mark_outbox_page_sent(conn, out_item["id"], p_num)
                     else:
-                        store.set_app_state(conn, "last_digest_date", today_str)
-                        is_daily_due = False
+                        store.mark_outbox_page_failed(conn, out_item["id"], p_num, p_err)
+                        all_pages_sent = False
+                        last_err = p_err
+                        break
+                if all_pages_sent and store.are_all_outbox_pages_sent(conn, out_item["id"]):
+                    store.update_outbox_status(conn, out_item["id"], "sent")
+                    _mark_outbox_done(conn, out_item["id"], out_item.get("key") or out_item["event_id"])
+                    if is_digest and not dry_run:
+                        ev_id = out_item.get("key") or out_item.get("event_id", "")
+                        out_date = None
+                        if ev_id.startswith("digest:"):
+                            out_date = ev_id.removeprefix("digest:")
+                        if out_date and out_date < today_str:
+                            store.set_app_state(conn, "last_digest_date", out_date)
+                        else:
+                            store.set_app_state(conn, "last_digest_date", today_str)
+                            is_daily_due = False
+                else:
+                    store.update_outbox_status(conn, out_item["id"], "failed", error_message=last_err)
+            else:
+                try:
+                    success, err = delivery.deliver(
+                        out_item["rendered_text"],
+                        dry_run=dry_run,
+                        conn=conn,
+                        outbox_id=out_item["id"],
+                    )
+                except TypeError:
+                    success, err = delivery.deliver(
+                        out_item["rendered_text"],
+                        dry_run=dry_run,
+                        conn=conn,
+                    )
+                store.update_outbox_status(
+                    conn,
+                    out_item["id"],
+                    "sent" if success else "failed",
+                    error_message=err,
+                )
+                if success:
+                    _mark_outbox_done(conn, out_item["id"], out_item.get("key") or out_item["event_id"])
+                    if is_digest and not dry_run:
+                        ev_id = out_item.get("key") or out_item.get("event_id", "")
+                        out_date = None
+                        if ev_id.startswith("digest:"):
+                            out_date = ev_id.removeprefix("digest:")
+                        if out_date and out_date < today_str:
+                            store.set_app_state(conn, "last_digest_date", out_date)
+                        else:
+                            store.set_app_state(conn, "last_digest_date", today_str)
+                            is_daily_due = False
 
     # Resume unfinished processing jobs independently of fetching
     unfinished_jobs = []
     for uj in store.get_pending_processing_jobs(conn):
-        if store.is_event_already_sent(conn, uj["id"], revision=uj.get("revision", 1), content_hash=uj.get("content_hash")):
-            store.mark_processing_job_done(conn, uj["id"])
+        uj_rev = uj.get("revision", 1)
+        if store.is_event_already_sent(conn, uj["id"], revision=uj_rev, content_hash=uj.get("content_hash")):
+            store.mark_processing_job_done(conn, uj["id"], revision=uj_rev)
         else:
             unfinished_jobs.append(uj)
 
@@ -232,8 +303,9 @@ def run_cycle(
 
     for ne in new_events:
         nid = ne["id"]
-        if store.is_event_already_sent(conn, nid, revision=ne.get("revision", 1), content_hash=ne.get("content_hash")):
-            store.mark_processing_job_done(conn, nid)
+        ne_rev = ne.get("revision", 1)
+        if store.is_event_already_sent(conn, nid, revision=ne_rev, content_hash=ne.get("content_hash")):
+            store.mark_processing_job_done(conn, nid, revision=ne_rev)
             continue
 
         if ne.get("triage_type") == "account_change":
@@ -347,11 +419,12 @@ def run_cycle(
                 use_stub=fixtures,
             )
 
+        rev = ev.get("revision", 1)
         if prio == "high":
             if enrichment.get("is_raw_mode"):
                 # An item whose enrichment failed is never sent as high priority:
                 # keep it pending for a bounded number of retries, then move it to the next daily digest marked as unenriched
-                attempts = store.increment_processing_job_attempts(conn, ev["id"])
+                attempts = store.increment_enrichment_attempts(conn, ev["id"], rev)
                 MAX_ENRICH_RETRIES = 3
                 if attempts < MAX_ENRICH_RETRIES:
                     log.warning(
@@ -381,16 +454,17 @@ def run_cycle(
             digest_items.append((ev, enrichment))
 
     # 5. Process high-priority events
-    today_high_sent = store.count_today_high_priority(conn)
+    today_high_sent = store.count_today_high_priority(conn, today_date=today_str)
     immediate_items = []
-    overflow_items = []
 
     for item in high_priority_items:
         if today_high_sent < 5:
             immediate_items.append(item)
             today_high_sent += 1
         else:
-            overflow_items.append(item)
+            ev, enr = item
+            ev["priority"] = "digest"
+            digest_items.append((ev, enr))
 
     for ev, enr in immediate_items:
         rev = ev.get("revision", 1)
@@ -400,55 +474,35 @@ def run_cycle(
             continue
 
         existing_out = store.get_outbox_for_event(conn, ev["id"], revision=rev)
-        if existing_out and existing_out["status"] == "sent":
-            _mark_all_notified(conn, ev, "sent")
-            _mark_all_done(conn, ev)
+        if existing_out and existing_out["status"] in ("sent", "ambiguous"):
+            if existing_out["status"] == "sent":
+                _mark_all_notified(conn, ev, "sent")
+                _mark_all_done(conn, ev)
             continue
 
         msg = renderer.render_high_priority_message(ev, enr)
         if existing_out:
             out_id = existing_out["id"]
         else:
-            out_id = store.add_to_outbox(conn, ev["id"], "high", msg, revision=rev)
-            store.link_outbox_events(conn, out_id, [ev])
+            out_id = store.add_to_outbox(conn, ev["id"], "high", msg, revision=rev, member_events=[ev])
+            _mark_all_notified(conn, ev, "pending")
 
-        success, err = delivery.deliver(msg, dry_run=dry_run, conn=conn, outbox_id=out_id)
+        try:
+            success, err = delivery.deliver(msg, dry_run=dry_run, conn=conn, outbox_id=out_id)
+        except TypeError:
+            success, err = delivery.deliver(msg, dry_run=dry_run, conn=conn)
+
         store.update_outbox_status(conn, out_id, "sent" if success else "failed", err)
         _mark_all_notified(conn, ev, "sent" if success else "failed")
         if success:
             _mark_all_done(conn, ev)
 
-    if overflow_items:
-        merged_pages = renderer.render_merged_pages(overflow_items)
-        for page_idx, (m_msg, page_items) in enumerate(merged_pages, 1):
-            page_events = [it[0] for it in page_items]
-            existing_out = store.find_existing_outbox_for_events(conn, page_events)
-            if existing_out and existing_out["status"] == "sent":
-                for p_ev in page_events:
-                    _mark_all_notified(conn, p_ev, "sent")
-                    _mark_all_done(conn, p_ev)
-                continue
-
-            merged_event_id = f"merged_high:{today_str}" if page_idx == 1 else f"merged_high:{today_str}:page_{page_idx}"
-            if existing_out:
-                out_id = existing_out["id"]
-            else:
-                out_id = store.add_to_outbox(conn, merged_event_id, "high", m_msg)
-                store.link_outbox_events(conn, out_id, page_events)
-                for p_ev in page_events:
-                    _mark_all_notified(conn, p_ev, "pending")
-
-            success, err = delivery.deliver(m_msg, dry_run=dry_run, conn=conn, outbox_id=out_id)
-            store.update_outbox_status(conn, out_id, "sent" if success else "failed", err)
-            for p_ev in page_events:
-                _mark_all_notified(conn, p_ev, "sent" if success else "failed")
-                if success:
-                    _mark_all_done(conn, p_ev)
-
     # 6. Process digest (daily or --digest or --fixtures or --baseline-digest)
+    digest_key = f"digest:{today_str}"
+    existing_digest = store.get_outbox_by_key(conn, digest_key)
     should_send_digest = digest_mode or is_daily_due or (fixtures and digest_items) or (baseline_digest and baseline_digest_items)
 
-    if should_send_digest:
+    if should_send_digest and not existing_digest:
         all_for_digest = list(digest_items)
         if baseline_digest and baseline_digest_items:
             for b_ev in baseline_digest_items:
@@ -460,35 +514,63 @@ def run_cycle(
                 b_enr = enricher.enrich_event(b_ev, profile_text=profile_text, use_stub=fixtures)
                 all_for_digest.append((b_ev, b_enr))
 
-        if all_for_digest:
-            digest_pages = renderer.render_digest_pages(all_for_digest)
-            for page_idx, (d_msg, page_items) in enumerate(digest_pages, 1):
-                page_events = [it[0] for it in page_items]
-                digest_event_id = f"digest:{today_str}" if page_idx == 1 else f"digest:{today_str}:page_{page_idx}"
-                existing_out = store.find_existing_outbox_for_events(conn, page_events)
-                existing_digest_out = store.get_outbox_for_event(conn, digest_event_id)
-                if (existing_out and existing_out["status"] == "sent") or (existing_digest_out and existing_digest_out["status"] == "sent"):
-                    for p_ev in page_events:
-                        _mark_all_notified(conn, p_ev, "sent")
-                        _mark_all_done(conn, p_ev)
-                    continue
+        unreserved_digest_items = []
+        for it in all_for_digest:
+            ev, enr = it
+            rev = ev.get("revision", 1)
+            if not store.is_event_revision_reserved(conn, ev["id"], rev):
+                unreserved_digest_items.append(it)
 
-                if existing_out:
-                    out_id = existing_out["id"]
-                elif existing_digest_out:
-                    out_id = existing_digest_out["id"]
+        ambiguous_cnt = store.count_ambiguous_outbox(conn)
+        if unreserved_digest_items or ambiguous_cnt > 0:
+            digest_pages = renderer.render_digest_pages(unreserved_digest_items, ambiguous_count=ambiguous_cnt)
+            all_member_events = [it[0] for it in unreserved_digest_items]
+            out_id = store.add_digest_to_outbox(
+                conn,
+                key=digest_key,
+                rendered_text=digest_pages[0][0] if digest_pages else "",
+                pages=digest_pages,
+                member_events=all_member_events,
+            )
+            for ev in all_member_events:
+                _mark_all_notified(conn, ev, "pending")
+
+            unsent_pages = store.get_unsent_outbox_pages(conn, out_id)
+            all_pages_sent = True
+            last_err = ""
+            for pg in unsent_pages:
+                p_num = pg["page_number"]
+                p_text = pg["rendered_text"]
+                try:
+                    p_success, p_err = delivery.deliver(
+                        p_text,
+                        dry_run=dry_run,
+                        conn=conn,
+                        outbox_id=out_id,
+                        page_number=p_num,
+                    )
+                except TypeError:
+                    p_success, p_err = delivery.deliver(
+                        p_text,
+                        dry_run=dry_run,
+                        conn=conn,
+                        outbox_id=out_id,
+                    )
+                if p_success:
+                    store.mark_outbox_page_sent(conn, out_id, p_num)
                 else:
-                    out_id = store.add_to_outbox(conn, digest_event_id, "digest", d_msg)
-                    store.link_outbox_events(conn, out_id, page_events)
-                    for p_ev in page_events:
-                        _mark_all_notified(conn, p_ev, "pending")
+                    store.mark_outbox_page_failed(conn, out_id, p_num, p_err)
+                    all_pages_sent = False
+                    last_err = p_err
+                    break
 
-                success, err = delivery.deliver(d_msg, dry_run=dry_run, conn=conn, outbox_id=out_id)
-                store.update_outbox_status(conn, out_id, "sent" if success else "failed", err)
-                for p_ev in page_events:
-                    _mark_all_notified(conn, p_ev, "sent" if success else "failed")
-                    if success:
-                        _mark_all_done(conn, p_ev)
+            if all_pages_sent and store.are_all_outbox_pages_sent(conn, out_id):
+                store.update_outbox_status(conn, out_id, "sent")
+                _mark_outbox_done(conn, out_id, digest_key)
+                for ev in all_member_events:
+                    _mark_all_notified(conn, ev, "sent")
+            else:
+                store.update_outbox_status(conn, out_id, "failed", error_message=last_err)
 
         if not dry_run and (is_daily_due or digest_mode):
             store.set_app_state(conn, "last_digest_date", today_str)

@@ -64,6 +64,7 @@ def deliver(
     dry_run: bool = False,
     conn=None,
     outbox_id: int | None = None,
+    page_number: int | None = None,
 ) -> tuple[bool, str]:
     """Dispatch message: print to stdout if dry_run, otherwise send to Telegram chats."""
     if dry_run:
@@ -91,6 +92,10 @@ def deliver(
 
     if conn is not None and outbox_id is not None:
         from . import store
+        # Persist delivery state = 'sending' BEFORE the HTTP call (at-most-once safety)
+        store.update_outbox_status(conn, outbox_id, "sending")
+        if page_number is not None:
+            store.mark_outbox_page_status(conn, outbox_id, page_number, "sending")
         store.init_outbox_deliveries(conn, outbox_id, chat_ids)
         pending_cids = store.get_pending_delivery_chat_ids(conn, outbox_id)
         # N4: Retry only recipients that are both pending and currently configured

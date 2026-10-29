@@ -26,6 +26,16 @@ _SECURITY_KEYWORDS = (
     "exploit",
 )
 
+_SECURITY_RE = re.compile(
+    r"\b(cve-[0-9a-z.-]+|vulnerabilit(?:y|ies)|security\s+fix(?:es)?|security\s+advisor(?:y|ies)|critical\s+patch(?:es)?|auth\s+bypass|rce|exploits?)\b",
+    re.IGNORECASE,
+)
+
+_SUPPORT_FOR_MODEL_RE = re.compile(
+    r"\b(?:add(?:ed|ing)?\s+support\s+for|supports?|support\s+for|integrat(?:ed|ing|ion\s+with))\s+(?:gpt|gemini|claude|opus|sonnet|haiku)",
+    re.IGNORECASE,
+)
+
 _BREAKING_KEYWORDS = (
     "breaking change",
     "breaking:",
@@ -187,16 +197,24 @@ def classify_event(event: dict) -> tuple[str, str]:
 
     # Pre-releases are noise unless security fixes / vulnerabilities
     if prerelease_flag:
-        if any(k in full_text for k in _SECURITY_KEYWORDS):
+        if bool(_SECURITY_RE.search(full_text)):
             return "security", "high"
         return "prerelease", "ignore"
+
+    # Customer stories, case studies and partner posts ("is transforming", "how X uses", "customer story") are at most digest.
+    # The customer-story / case-study cap applies before any high return.
+    is_customer_story = any(k in full_text for k in _CUSTOMER_STORY_KEYWORDS) or bool(_CUSTOMER_STORY_RE.search(full_text))
+    if is_customer_story:
+        if any(k in full_text for k in _FEATURE_KEYWORDS):
+            return "feature", "digest"
+        return "other", "digest"
 
     # 1. Deprecation / shutdown -> always high for stable releases
     if any(k in full_text for k in _DEPRECATION_KEYWORDS):
         return "deprecation", "high"
 
-    # 2. Security fixes / vulnerabilities -> always high
-    if any(k in full_text for k in _SECURITY_KEYWORDS):
+    # 2. Security fixes / vulnerabilities -> always high (matched with word boundaries)
+    if bool(_SECURITY_RE.search(full_text)):
         return "security", "high"
 
     # 3. Breaking changes (explicit keyword or SemVer major bump)
@@ -218,39 +236,28 @@ def classify_event(event: dict) -> tuple[str, str]:
         if major >= 2 and minor == 0 and patch == 0:
             return "breaking", "high"
 
-    # Pre-releases are noise unless security or breaking (handled above)
-    if prerelease_flag:
-        return "prerelease", "ignore"
-
-    # Customer stories, case studies and partner posts ("is transforming", "how X uses", "customer story") are at most digest
-    is_customer_story = any(k in full_text for k in _CUSTOMER_STORY_KEYWORDS) or bool(_CUSTOMER_STORY_RE.search(full_text))
-
-    # 4. New model releases -> high only when NOT a customer story and item announces a model release (model name/id plus release wording)
+    # 4. New model releases -> high only when release wording refers to the named model itself
+    # SDK releases (e.g. "added support for GPT-4o") must NOT become new_model/high
+    is_sdk = "sdk" in product or "python" in product or "cli" in product or "sdk" in source_id or "client" in product
+    is_support_phrase = bool(_SUPPORT_FOR_MODEL_RE.search(full_text))
     has_model_name = bool(_MODEL_NAME_RE.search(full_text))
     has_release_wording = any(k in full_text for k in _MODEL_RELEASE_WORDING)
 
-    if not is_customer_story and has_model_name and has_release_wording:
+    if not is_sdk and not is_support_phrase and has_model_name and has_release_wording:
         return "new_model", "high"
 
-    # 5. Pricing updates -> high (unless customer story)
-    if not is_customer_story and any(k in full_text for k in _PRICING_KEYWORDS):
+    # 5. Pricing updates -> high
+    if any(k in full_text for k in _PRICING_KEYWORDS):
         return "pricing", "high"
 
-    # Customer stories, case studies, and partner posts are at most digest
-    if is_customer_story:
-        if any(k in full_text for k in _FEATURE_KEYWORDS):
-            return "feature", "digest"
-        return "other", "digest"
-
     # 6. SDK patch releases -> digest unless security/breaking (handled above)
-    is_sdk = "sdk" in product or "python" in product or "cli" in product or "sdk" in source_id
     if is_sdk and semver:
         _, _, patch = semver
         if patch > 0:
             return "sdk_patch", "digest"
 
     # 7. Features
-    if any(k in full_text for k in _FEATURE_KEYWORDS):
+    if any(k in full_text for k in _FEATURE_KEYWORDS) or is_support_phrase:
         return "feature", "digest"
 
     if semver and semver[2] > 0:
