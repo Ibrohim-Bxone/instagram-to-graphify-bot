@@ -35,22 +35,54 @@ _BREAKING_KEYWORDS = (
     "migration guide",
 )
 
-_NEW_MODEL_KEYWORDS = (
-    "new model",
-    "introducing gpt",
-    "introducing gemini",
-    "introducing claude",
+_CUSTOMER_STORY_KEYWORDS = (
+    "is transforming",
+    "are transforming",
+    "transforming the",
+    "customer story",
+    "customer stories",
+    "case study",
+    "case studies",
+    "partner post",
+    "partner posts",
+    "partner story",
+    "partner stories",
+    "partner spotlight",
+    "customer spotlight",
+    "success story",
+    "success stories",
+)
+
+_CUSTOMER_STORY_RE = re.compile(
+    r"\bhow\s+[a-zA-Z0-9_\-.]+\s+(?:uses|is using|built|leverages|powers|accelerates|scales)\b",
+    re.IGNORECASE,
+)
+
+_MODEL_NAME_RE = re.compile(
+    r"\b(?:gpt-[0-9a-z.\-]+|gemini-[0-9a-z.\-]+|gemini\s+[0-9.]+|claude-[0-9a-z.\-]+|claude\s+[0-9.]+|opus\s+[0-9.]+|sonnet\s+[0-9.]+|haiku\s+[0-9.]+|argon|astra)\b",
+    re.IGNORECASE,
+)
+
+_MODEL_RELEASE_WORDING = (
+    "introducing",
+    "announcing",
+    "announces",
+    "release",
+    "releases",
+    "released",
+    "releasing",
     "model release",
-    "opus 5",
-    "sonnet 4",
-    "gemini 2.5",
-    "gemini 3",
-    "gemini 4",
-    "gpt-5",
-    "gpt-6",
-    "claude 4",
-    "argon",
-    "astra",
+    "new model",
+    "foundation model",
+    "frontier model",
+    "generally available",
+    "now available",
+    "launches",
+    "launched",
+    "launching",
+    "presents",
+    "unveils",
+    "unveiled",
 )
 
 _PRICING_KEYWORDS = (
@@ -190,13 +222,25 @@ def classify_event(event: dict) -> tuple[str, str]:
     if prerelease_flag:
         return "prerelease", "ignore"
 
-    # 4. New model releases -> high
-    if any(k in full_text for k in _NEW_MODEL_KEYWORDS):
+    # Customer stories, case studies and partner posts ("is transforming", "how X uses", "customer story") are at most digest
+    is_customer_story = any(k in full_text for k in _CUSTOMER_STORY_KEYWORDS) or bool(_CUSTOMER_STORY_RE.search(full_text))
+
+    # 4. New model releases -> high only when NOT a customer story and item announces a model release (model name/id plus release wording)
+    has_model_name = bool(_MODEL_NAME_RE.search(full_text))
+    has_release_wording = any(k in full_text for k in _MODEL_RELEASE_WORDING)
+
+    if not is_customer_story and has_model_name and has_release_wording:
         return "new_model", "high"
 
-    # 5. Pricing updates -> high
-    if any(k in full_text for k in _PRICING_KEYWORDS):
+    # 5. Pricing updates -> high (unless customer story)
+    if not is_customer_story and any(k in full_text for k in _PRICING_KEYWORDS):
         return "pricing", "high"
+
+    # Customer stories, case studies, and partner posts are at most digest
+    if is_customer_story:
+        if any(k in full_text for k in _FEATURE_KEYWORDS):
+            return "feature", "digest"
+        return "other", "digest"
 
     # 6. SDK patch releases -> digest unless security/breaking (handled above)
     is_sdk = "sdk" in product or "python" in product or "cli" in product or "sdk" in source_id

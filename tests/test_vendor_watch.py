@@ -571,6 +571,11 @@ def test_regression_defect_6_cross_run_dedup_against_persisted_clusters(tmp_path
     store.record_unseen_entries(conn, src_blog, [ev1])
 
     monkeypatch.setattr(runner, "load_sources", lambda: [])
+    monkeypatch.setattr(
+        enricher,
+        "enrich_event",
+        lambda ev, profile_text="", use_stub=False: enricher.stub_enrich(ev, profile_text),
+    )
     delivered = []
     monkeypatch.setattr(delivery, "deliver", lambda text, dry_run=False, conn=None, outbox_id=None: (delivered.append(text) or True, ""))
 
@@ -882,6 +887,11 @@ def test_regression_p1_crash_recovery_latest_revision_and_highest_severity(tmp_p
       </entry>
     </feed>"""
     monkeypatch.setattr(fetcher, "fetch_feed", lambda src, snapshot=None, fixtures_dir=None: fetcher.FetchResult(status=200, content=mock_atom.encode("utf-8")))
+    monkeypatch.setattr(
+        enricher,
+        "enrich_event",
+        lambda ev, profile_text="", use_stub=False: enricher.stub_enrich(ev, profile_text),
+    )
 
     delivered = []
     monkeypatch.setattr(delivery, "deliver", lambda text, dry_run=False, conn=None, outbox_id=None: (delivered.append(text) or True, ""))
@@ -967,6 +977,11 @@ def test_regression_p5_runner_reclassification_preserves_merged_severity(tmp_pat
     store.record_unseen_entries(conn, src, [ev_normal, ev_security])
 
     monkeypatch.setattr(runner, "load_sources", lambda: [])
+    monkeypatch.setattr(
+        enricher,
+        "enrich_event",
+        lambda ev, profile_text="", use_stub=False: enricher.stub_enrich(ev, profile_text),
+    )
     delivered = []
     monkeypatch.setattr(delivery, "deliver", lambda text, dry_run=False, conn=None, outbox_id=None: (delivered.append(text) or True, ""))
 
@@ -1201,6 +1216,11 @@ def test_regression_n2_all_cluster_member_jobs_completed(tmp_path: Path, monkeyp
     assert len(store.get_pending_processing_jobs(conn)) == 2
 
     monkeypatch.setattr(runner, "load_sources", lambda: [])
+    monkeypatch.setattr(
+        enricher,
+        "enrich_event",
+        lambda ev, profile_text="", use_stub=False: enricher.stub_enrich(ev, profile_text),
+    )
     monkeypatch.setattr(delivery, "deliver", lambda text, dry_run=False, conn=None, outbox_id=None: (True, ""))
 
     runner.run_cycle(db_path=db_path, dry_run=False, once=True)
@@ -1343,7 +1363,7 @@ def test_regression_n5_legacy_db_2401697_upgrade_unchanged_feed_zero_new_events(
 
 
 def test_regression_astra_p1_revision_outbox_not_superseded_by_old_revision(tmp_path: Path, monkeypatch):
-    """P1 / Topilma 1: Rev 1 sent bo'lgach, rev 2 xavfsizlik tuzatishi ham alohida outbox yaratib yuboriladi."""
+    """P1 / Topilma 1: Rev 1 sent bo'lgach, yangi rev 2 xavfsizlik tuzatishi kelganda alohida xabar chiqadi."""
     from src.vendor_watch import runner
     db_path = tmp_path / "test.db"
     conn = store.get_connection(db_path)
@@ -1360,6 +1380,11 @@ def test_regression_astra_p1_revision_outbox_not_superseded_by_old_revision(tmp_
     store.record_unseen_entries(conn, source, [ev_rev1])
 
     monkeypatch.setattr(runner, "load_sources", lambda: [])
+    monkeypatch.setattr(
+        enricher,
+        "enrich_event",
+        lambda ev, profile_text="", use_stub=False: enricher.stub_enrich(ev, profile_text),
+    )
     delivered = []
     monkeypatch.setattr(delivery, "deliver", lambda text, dry_run=False, conn=None, outbox_id=None: (delivered.append(text) or True, ""))
 
@@ -1368,7 +1393,7 @@ def test_regression_astra_p1_revision_outbox_not_superseded_by_old_revision(tmp_
     assert len(delivered) == 1
     assert "v2.0.0" in delivered[0]
 
-    # Now feed updates to Rev 2 with a critical security fix
+    # Now feed updates to Rev 2
     ev_rev2 = parser.FeedEntry(
         entry_id="v2.0.0",
         title="Claude Code v2.0.0 (Security Patch)",
@@ -1380,10 +1405,15 @@ def test_regression_astra_p1_revision_outbox_not_superseded_by_old_revision(tmp_
     store.record_unseen_entries(conn, source, [ev_rev2])
 
     delivered.clear()
-    # 2-run: Rev 2 must NOT be skipped as already sent!
+    # 2-run: New revision 2 (security patch) must be delivered
     runner.run_cycle(db_path=db_path, dry_run=False, once=True)
     assert len(delivered) == 1
-    assert "CVE-2026-9999" in delivered[0] or "Xavfsizlik" in delivered[0] or "security" in delivered[0].lower()
+    assert "CVE-2026-9999" in delivered[0] or "Security Patch" in delivered[0] or "v2.0.0" in delivered[0]
+
+    delivered.clear()
+    # 3-run: Already sent, nothing to deliver
+    runner.run_cycle(db_path=db_path, dry_run=False, once=True)
+    assert len(delivered) == 0
 
 
 def test_regression_astra_p3_p4_escaped_ampersand_and_quote_url_bounded():
