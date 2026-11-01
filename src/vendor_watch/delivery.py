@@ -4,9 +4,28 @@ import json
 import logging
 import os
 import sys
+import re
+import urllib.error
 import urllib.request
 
 log = logging.getLogger(__name__)
+
+
+def classify_telegram_error(exc: Exception) -> str:
+    """Classify Telegram delivery error as 'failed' (definite rejection) or 'ambiguous' (unknown outcome).
+
+    Definite HTTP 4xx/5xx responses are 'failed'.
+    Timeouts, connection drops/resets, and all unconfirmed network errors default to 'ambiguous'.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        if 400 <= exc.code < 600:
+            return "failed"
+    if hasattr(exc, "code") and isinstance(exc.code, int) and 400 <= exc.code < 600:
+        return "failed"
+    msg = str(exc).lower()
+    if re.search(r"\bhttp\s+[45]\d\d\b", msg):
+        return "failed"
+    return "ambiguous"
 
 
 def _safe_print(text: str) -> None:
@@ -110,18 +129,30 @@ def deliver(
 
     errors = []
     for cid in pending_cids:
+        if conn is not None and outbox_id is not None:
+            from . import store
+            store.mark_delivery_sending(conn, outbox_id, cid, page_number=p_num)
         try:
             send_to_telegram(token, cid, text)
             if conn is not None and outbox_id is not None:
                 from . import store
                 store.record_delivery_attempt(conn, outbox_id, cid, success=True, page_number=p_num)
         except Exception as e:
-            err_msg = f"Chat {cid} ga yuborishda xato: {e}"
+            err_st = classify_telegram_error(e)
+            err_msg = f"Chat {cid} ga yuborishda xato ({err_st}): {e}"
             log.error(err_msg)
             errors.append(err_msg)
             if conn is not None and outbox_id is not None:
                 from . import store
-                store.record_delivery_attempt(conn, outbox_id, cid, success=False, error=str(e), page_number=p_num)
+                store.record_delivery_attempt(
+                    conn,
+                    outbox_id,
+                    cid,
+                    success=False,
+                    error=str(e),
+                    page_number=p_num,
+                    status=err_st,
+                )
 
     if errors:
         return False, "; ".join(errors)

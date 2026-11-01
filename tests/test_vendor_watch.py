@@ -683,6 +683,8 @@ def test_regression_defect_8_dry_run_does_not_mutate_persistent_db(tmp_path: Pat
 
 def test_regression_defect_9_delivery_tracks_per_recipient(tmp_path: Path, monkeypatch):
     """Defect 9: Partial recipient failure tracks delivery per recipient and never re-sends to succeeded recipients."""
+    import urllib.error
+
     db_path = tmp_path / "test.db"
     conn = store.get_connection(db_path)
 
@@ -693,7 +695,7 @@ def test_regression_defect_9_delivery_tracks_per_recipient(tmp_path: Path, monke
     sent_to = []
     def mock_send(token, chat_id, text, timeout=15):
         if chat_id == "chat-err":
-            raise RuntimeError("Telegram network drop for chat-err")
+            raise urllib.error.HTTPError("https://api.telegram.org", 502, "Bad Gateway", {}, None)
         sent_to.append(chat_id)
 
     monkeypatch.setattr(delivery, "send_to_telegram", mock_send)
@@ -713,6 +715,30 @@ def test_regression_defect_9_delivery_tracks_per_recipient(tmp_path: Path, monke
     success2, err2 = delivery.deliver("Alert text", dry_run=False, conn=conn, outbox_id=out_id)
     assert success2 is True
     assert sent_to == ["chat-err"]  # Only the failed recipient is retried!
+
+    # 3. Qo'shimcha holat: oddiy RuntimeError tarmoq uzilishi -> ambiguous, qayta yuborilmaydi
+    out_id_amb = store.add_to_outbox(conn, "ev-9-amb", "high", "Alert ambiguous text")
+    sent_to_amb = []
+    def mock_send_amb(token, chat_id, text, timeout=15):
+        if chat_id == "chat-err":
+            raise RuntimeError("Telegram network drop unconfirmed")
+        sent_to_amb.append(chat_id)
+
+    monkeypatch.setattr(delivery, "send_to_telegram", mock_send_amb)
+    success_amb, err_amb = delivery.deliver("Alert ambiguous text", dry_run=False, conn=conn, outbox_id=out_id_amb)
+    assert success_amb is False
+    assert sent_to_amb == ["chat-ok"]
+
+    # Verify chat-err status in outbox_deliveries is 'ambiguous'
+    cur = conn.cursor()
+    cur.execute("SELECT status FROM outbox_deliveries WHERE outbox_id = ? AND chat_id = 'chat-err'", (out_id_amb,))
+    assert cur.fetchone()[0] == "ambiguous"
+
+    # Retry attempt: ambiguous recipient is NOT retried!
+    sent_to_amb.clear()
+    monkeypatch.setattr(delivery, "send_to_telegram", lambda token, chat_id, text, timeout=15: sent_to_amb.append(chat_id))
+    success_amb2, err_amb2 = delivery.deliver("Alert ambiguous text", dry_run=False, conn=conn, outbox_id=out_id_amb)
+    assert sent_to_amb == []
 
 
 def test_regression_defect_10_raw_mode_strips_html_tags():
@@ -1545,6 +1571,8 @@ def test_regression_astra_p6_failed_digest_retried_sent_cross_run_dedup(tmp_path
     assert row is not None and row[0] == "failed"
 
     # Run 2: Retry succeeds!
+    with store.get_connection(db_path) as c:
+        c.execute("UPDATE outbox SET next_attempt_at = ''")
     delivered = []
     monkeypatch.setattr(delivery, "deliver", lambda text, dry_run=False, conn=None, outbox_id=None: (delivered.append(text) or True, ""))
     runner.run_cycle(db_path=db_path, dry_run=False, digest_mode=True, once=True)

@@ -73,6 +73,8 @@ def test_two_runs_failed_first_delivery_one_message_total(tmp_path: Path, monkey
 
     # Run 2: Delivery succeeds
     should_fail = False
+    with store.get_connection(db_path) as c:
+        c.execute("UPDATE outbox SET next_attempt_at = ''")
     runner.run_cycle(db_path=db_path, dry_run=False, once=True)
     assert len(delivered) == 1
 
@@ -510,8 +512,8 @@ def test_regression_topilma1_digest_items_during_day_accumulate_without_overwrit
 
 
 def test_regression_topilma2_failed_yesterday_digest_retry_does_not_suppress_today_digest(tmp_path: Path, monkeypatch):
-    """Topilma 2: Kechagi kundan qolgan dayjest retry qilinganda bugungi yangi dayjest surilib ketmaydi."""
-    db_path = tmp_path / "test_retry_date.db"
+    """Topilma 2: Kechagi dayjest bugun retry bilan yetkazilsa last_digest_date == bugun va o'sha siklda bugungi yangi dayjest yuborilmaydi (F4)."""
+    db_path = tmp_path / "test_topilma2_yesterday_retry.db"
     conn = store.get_connection(db_path)
 
     source = {"id": "src-suppress", "vendor": "OpenAI", "product": "Python SDK"}
@@ -543,15 +545,16 @@ def test_regression_topilma2_failed_yesterday_digest_retry_does_not_suppress_tod
     # 3. Bugungi kun (2026-10-29) uchun rejaviy sikl
     runner.run_cycle(db_path=db_path, dry_run=False, digest_mode=False, once=True, today_date="2026-10-29")
 
-    # Ikkita xabar ham yetkazilishi kerak:
-    # 1) Kechagi retry qilingan dayjest
-    # 2) Bugungi yangi hodisalar dayjesti
-    assert len(delivered) == 2
+    # Faqat kechagi retry qilingan dayjest yetkaziladi; bugungi yangi dayjest o'sha siklda yuborilmaydi
+    assert len(delivered) == 1
     assert "Kechagi 2026-10-28 dayjest matni" in delivered[0]
-    assert "v2.1.0" in delivered[1]
 
     # last_digest_date bugungi kunga teng bo'lishi kerak
     assert store.get_app_state(conn, "last_digest_date") == "2026-10-29"
+
+    # Bugungi yangi hodisa processing_jobs'da saqlanib qolgan (yo'qolmagan)
+    jobs = store.get_pending_processing_jobs(conn)
+    assert any(j["entry_id"] == "v2.1.0" for j in jobs)
 
 
 def test_regression_topilma3_retried_group_outbox_marks_member_jobs_done(tmp_path: Path, monkeypatch):
@@ -652,6 +655,8 @@ def test_review50_defect2_failed_digest_not_repackaged_with_later_items(tmp_path
     store.record_unseen_entries(conn, src, [ev2])
 
     # Second run on same day: delivery succeeds
+    with store.get_connection(db_path) as c:
+        c.execute("UPDATE outbox SET next_attempt_at = ''")
     delivered = []
     monkeypatch.setattr(delivery, "deliver", lambda text, dry_run=False, conn=None, outbox_id=None: (delivered.append(text) or True, ""))
     runner.run_cycle(db_path=db_path, dry_run=False, digest_mode=True, once=True, today_date="2026-10-29")
@@ -1337,6 +1342,8 @@ def test_review61_defect2_last_digest_date_set_only_after_all_pages_delivered(tm
     monkeypatch.setattr(delivery, "deliver", successful_deliver)
 
     # Next cycle retries the digest
+    with store.get_connection(db_path) as c:
+        c.execute("UPDATE outbox SET next_attempt_at = ''")
     runner.run_cycle(db_path=db_path, dry_run=False, digest_mode=True, once=True)
 
     # Now that all pages were delivered, last_digest_date MUST be set to today

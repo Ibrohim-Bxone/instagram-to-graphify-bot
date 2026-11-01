@@ -109,14 +109,16 @@ def _derive_consistent_outbox_and_page_statuses(conn: sqlite3.Connection) -> Non
 
             cur.execute("SELECT status FROM outbox_pages WHERE outbox_id = ?", (oid,))
             p_statuses = {r[0] for r in cur.fetchall()}
-            if cur_out_status in ("ambiguous", "sending"):
-                new_out_st = "ambiguous"
-            elif "ambiguous" in p_statuses:
-                new_out_st = "ambiguous"
+            if cur_out_status == "failed_final":
+                new_out_st = "failed_final"
             elif "failed" in p_statuses:
                 new_out_st = "failed"
             elif "pending" in p_statuses:
                 new_out_st = "pending"
+            elif cur_out_status in ("ambiguous", "sending"):
+                new_out_st = "ambiguous"
+            elif "ambiguous" in p_statuses:
+                new_out_st = "ambiguous"
             else:
                 new_out_st = "sent"
         else:
@@ -138,14 +140,16 @@ def _derive_consistent_outbox_and_page_statuses(conn: sqlite3.Connection) -> Non
                 else:
                     eff_set.add("pending")
 
-            if cur_out_status in ("ambiguous", "sending"):
-                new_out_st = "ambiguous"
-            elif "ambiguous" in eff_set:
-                new_out_st = "ambiguous"
+            if cur_out_status == "failed_final":
+                new_out_st = "failed_final"
             elif "failed" in eff_set:
                 new_out_st = "failed"
             elif "pending" in eff_set:
                 new_out_st = "pending"
+            elif cur_out_status in ("ambiguous", "sending"):
+                new_out_st = "ambiguous"
+            elif "ambiguous" in eff_set:
+                new_out_st = "ambiguous"
             else:
                 new_out_st = "sent"
 
@@ -464,6 +468,76 @@ def collapse_outbox_duplicates(conn: sqlite3.Connection) -> list[dict]:
     return collapsed_records
 
 
+def _recover_sending_outbox(conn: sqlite3.Connection) -> int:
+    """Startup crash recovery for sending rows.
+
+    F1 & F3: Marks in-flight deliveries and pages left in 'sending' as 'ambiguous'.
+    Preserves unattempted 'pending' and completed 'sent' records.
+    Recovers outbox status based on remaining page/delivery work:
+    - if unattempted work remains ('pending'/'failed'), keeps outbox as 'pending'
+    - if all work was 'sent', marks outbox as 'sent'
+    - if all work was resolved and any was 'ambiguous', marks outbox as 'ambiguous'.
+    """
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox'")
+    if not cur.fetchone():
+        return 0
+
+    # 1. Any delivery left in 'sending' becomes 'ambiguous' (at-most-once safety)
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox_deliveries'")
+    if cur.fetchone():
+        conn.execute("UPDATE outbox_deliveries SET status = 'ambiguous' WHERE status = 'sending'")
+
+    # 2. Any page left in 'sending' becomes 'ambiguous'
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox_pages'")
+    has_pages_table = bool(cur.fetchone())
+    if has_pages_table:
+        conn.execute("UPDATE outbox_pages SET status = 'ambiguous' WHERE status = 'sending'")
+
+    # 3. Recover outbox rows left in 'sending'
+    cur.execute("SELECT id FROM outbox WHERE status = 'sending'")
+    sending_ids = [r[0] for r in cur.fetchall()]
+    for oid in sending_ids:
+        has_pages = False
+        if has_pages_table:
+            cur.execute("SELECT COUNT(*) FROM outbox_pages WHERE outbox_id = ?", (oid,))
+            has_pages = (cur.fetchone()[0] > 0)
+
+        if has_pages:
+            cur.execute("SELECT status FROM outbox_pages WHERE outbox_id = ?", (oid,))
+            p_statuses = {r[0] for r in cur.fetchall()}
+            if "pending" in p_statuses:
+                new_st = "pending"
+            elif "failed" in p_statuses:
+                cur.execute("SELECT attempts FROM outbox WHERE id = ?", (oid,))
+                att_r = cur.fetchone()
+                att = (att_r[0] if att_r else 0) or 0
+                new_st = "failed_final" if att >= 3 else "failed"
+            elif p_statuses and all(s == "sent" for s in p_statuses):
+                new_st = "sent"
+            else:
+                new_st = "ambiguous"
+        else:
+            cur.execute("SELECT status FROM outbox_deliveries WHERE outbox_id = ?", (oid,))
+            d_statuses = [r[0] for r in cur.fetchall()]
+            if not d_statuses:
+                new_st = "ambiguous"
+            elif any(s == "pending" for s in d_statuses):
+                new_st = "pending"
+            elif any(s == "failed" for s in d_statuses):
+                cur.execute("SELECT attempts FROM outbox WHERE id = ?", (oid,))
+                att_r = cur.fetchone()
+                att = (att_r[0] if att_r else 0) or 0
+                new_st = "failed_final" if att >= 3 else "failed"
+            elif all(s == "sent" for s in d_statuses):
+                new_st = "sent"
+            else:
+                new_st = "ambiguous"
+        conn.execute("UPDATE outbox SET status = ? WHERE id = ?", (new_st, oid))
+
+    return len(sending_ids)
+
+
 def _init_schema(conn: sqlite3.Connection) -> None:
     with conn:
         # Step 1: Create every table first
@@ -511,7 +585,9 @@ def _init_schema(conn: sqlite3.Connection) -> None:
                 error_message TEXT DEFAULT '',
                 created_at TEXT,
                 revision INTEGER DEFAULT 1,
-                kind TEXT DEFAULT ''
+                kind TEXT DEFAULT '',
+                sent_at TEXT DEFAULT '',
+                next_attempt_at TEXT DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS processing_jobs (
@@ -538,7 +614,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
                 status TEXT DEFAULT 'pending',
                 attempts INTEGER DEFAULT 0,
                 last_attempt_at TEXT DEFAULT '',
-                error_message TEXT DEFAULT ''
+                error_message TEXT DEFAULT '',
+                sent_at TEXT DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS event_notifications (
@@ -615,6 +692,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             ("attempts", "INTEGER DEFAULT 0"),
             ("last_attempt_at", "TEXT DEFAULT ''"),
             ("error_message", "TEXT DEFAULT ''"),
+            ("sent_at", "TEXT DEFAULT ''"),
+            ("next_attempt_at", "TEXT DEFAULT ''"),
         ]:
             if col not in out_cols:
                 try:
@@ -715,6 +794,14 @@ def _init_schema(conn: sqlite3.Connection) -> None:
                 )
             conn.execute("DROP TABLE outbox_deliveries_old")
 
+        cur.execute("PRAGMA table_info(outbox_deliveries)")
+        od_cols_current = {row[1] for row in cur.fetchall()}
+        if "sent_at" not in od_cols_current:
+            try:
+                conn.execute("ALTER TABLE outbox_deliveries ADD COLUMN sent_at TEXT DEFAULT ''")
+            except Exception:
+                pass
+
         cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='event_notifications'")
         en_row = cur.fetchone()
         if en_row and "PRIMARY KEY" in en_row[0].upper() and "REVISION" not in en_row[0].upper():
@@ -748,18 +835,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
                 )
             conn.execute("DROP TABLE event_notifications_old")
 
-        # Step 3: Startup recovery: mark any outbox rows, pages, and deliveries left in 'sending' as 'ambiguous'
-        conn.execute("UPDATE outbox SET status = 'ambiguous' WHERE status = 'sending'")
-        conn.execute("UPDATE outbox_pages SET status = 'ambiguous' WHERE status = 'sending'")
-        conn.execute("UPDATE outbox_deliveries SET status = 'ambiguous' WHERE status = 'sending'")
-        conn.execute(
-            """
-            UPDATE outbox_deliveries
-            SET status = 'ambiguous'
-            WHERE status IN ('pending', 'sending')
-              AND outbox_id IN (SELECT id FROM outbox WHERE status = 'ambiguous')
-            """
-        )
+        # Step 3: Startup recovery: recover rows left in 'sending'
+        _recover_sending_outbox(conn)
 
         # Step 4: Migrate legacy rows and collapse duplicates
         collapse_outbox_duplicates(conn)
@@ -1500,6 +1577,7 @@ def update_outbox_status(
     outbox_id: int,
     status: str,
     error_message: str = "",
+    next_attempt_at: str | None = None,
 ) -> None:
     now_iso = datetime.now().isoformat()
     with conn:
@@ -1507,6 +1585,8 @@ def update_outbox_status(
         cur.execute("PRAGMA table_info(outbox)")
         cols = {r[1] for r in cur.fetchall()}
         has_last = "last_attempt_at" in cols
+        has_sent_at = "sent_at" in cols
+        has_next_at = "next_attempt_at" in cols
 
         if status == "sending":
             if has_last:
@@ -1521,7 +1601,32 @@ def update_outbox_status(
                 )
             return
 
-        if has_last:
+        # Definite failure cap at 3 attempts -> failed_final
+        if status == "failed":
+            cur.execute("SELECT attempts FROM outbox WHERE id = ?", (outbox_id,))
+            att_row = cur.fetchone()
+            cur_att = (att_row[0] or 0) if att_row else 0
+            new_att = cur_att + 1
+            if new_att >= 3:
+                status = "failed_final"
+            if next_attempt_at is None:
+                next_attempt_at = (datetime.now() + timedelta(minutes=15 * new_att)).isoformat()
+
+        next_at_val = next_attempt_at if next_attempt_at is not None else ""
+
+        if has_last and has_sent_at and has_next_at:
+            conn.execute(
+                """
+                UPDATE outbox
+                SET status = ?, attempts = attempts + 1, last_attempt_at = ?,
+                    sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END,
+                    next_attempt_at = CASE WHEN ? = 'failed' THEN ? ELSE '' END,
+                    error_message = ?
+                WHERE id = ?
+                """,
+                (status, now_iso, status, now_iso, status, next_at_val, error_message, outbox_id),
+            )
+        elif has_last:
             conn.execute(
                 """
                 UPDATE outbox
@@ -1571,7 +1676,7 @@ def get_unsent_outbox_pages(conn: sqlite3.Connection, outbox_id: int) -> list[di
     cur.execute(
         """
         SELECT * FROM outbox_pages
-        WHERE outbox_id = ? AND status != 'sent'
+        WHERE outbox_id = ? AND status IN ('pending', 'failed')
         ORDER BY page_number ASC
         """,
         (outbox_id,),
@@ -1716,22 +1821,7 @@ def are_all_outbox_pages_sent(conn: sqlite3.Connection, outbox_id: int) -> bool:
 
 def mark_sending_outbox_ambiguous(conn: sqlite3.Connection) -> int:
     with conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE outbox SET status = 'ambiguous' WHERE status = 'sending'")
-        cnt = cur.rowcount
-        conn.execute("UPDATE outbox_pages SET status = 'ambiguous' WHERE status = 'sending'")
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox_deliveries'")
-        if cur.fetchone():
-            conn.execute("UPDATE outbox_deliveries SET status = 'ambiguous' WHERE status = 'sending'")
-            conn.execute(
-                """
-                UPDATE outbox_deliveries
-                SET status = 'ambiguous'
-                WHERE status IN ('pending', 'sending')
-                  AND outbox_id IN (SELECT id FROM outbox WHERE status = 'ambiguous')
-                """
-            )
-        return cnt
+        return _recover_sending_outbox(conn)
 
 
 def count_ambiguous_outbox(conn: sqlite3.Connection) -> int:
@@ -1744,15 +1834,70 @@ def count_ambiguous_outbox(conn: sqlite3.Connection) -> int:
 def count_today_high_priority(conn: sqlite3.Connection, today_date: str | None = None) -> int:
     today_start = today_date or datetime.now().date().isoformat()
     cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT COUNT(*) AS cnt FROM outbox
-        WHERE priority = 'high' AND status = 'sent' AND (created_at >= ? OR key LIKE ?)
-        """,
-        (today_start, f"%:{today_start}%"),
-    )
+    cur.execute("PRAGMA table_info(outbox)")
+    cols = {r[1] for r in cur.fetchall()}
+    has_sent_at = "sent_at" in cols
+    if has_sent_at:
+        cur.execute(
+            """
+            SELECT COUNT(*) AS cnt FROM outbox
+            WHERE priority = 'high' AND status = 'sent'
+              AND (
+                (sent_at != '' AND sent_at LIKE ?)
+                OR (sent_at = '' AND last_attempt_at != '' AND last_attempt_at LIKE ?)
+                OR (sent_at = '' AND last_attempt_at = '' AND (created_at LIKE ? OR key LIKE ?))
+              )
+            """,
+            (f"{today_start}%", f"{today_start}%", f"{today_start}%", f"%:{today_start}%"),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT COUNT(*) AS cnt FROM outbox
+            WHERE priority = 'high' AND status = 'sent' AND (created_at >= ? OR key LIKE ?)
+            """,
+            (today_start, f"%:{today_start}%"),
+        )
     row = cur.fetchone()
     return int(row["cnt"]) if row else 0
+
+
+def was_digest_page_sent_today(conn: sqlite3.Connection, today_date: str | None = None) -> bool:
+    today_start = today_date or datetime.now().date().isoformat()
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox_deliveries'")
+    if not cur.fetchone():
+        return False
+    cur.execute("PRAGMA table_info(outbox_deliveries)")
+    od_cols = {r[1] for r in cur.fetchall()}
+    has_sent_at = "sent_at" in od_cols
+
+    if has_sent_at:
+        cur.execute(
+            """
+            SELECT 1 FROM outbox_deliveries od
+            JOIN outbox o ON od.outbox_id = o.id
+            WHERE o.priority = 'digest' AND od.status = 'sent'
+              AND (
+                (od.sent_at != '' AND od.sent_at LIKE ?)
+                OR (od.last_attempt_at != '' AND od.last_attempt_at LIKE ?)
+              )
+            LIMIT 1
+            """,
+            (f"{today_start}%", f"{today_start}%"),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT 1 FROM outbox_deliveries od
+            JOIN outbox o ON od.outbox_id = o.id
+            WHERE o.priority = 'digest' AND od.status = 'sent'
+              AND od.last_attempt_at LIKE ?
+            LIMIT 1
+            """,
+            (f"{today_start}%",),
+        )
+    return bool(cur.fetchone())
 
 
 def get_pending_processing_jobs(conn: sqlite3.Connection) -> list[dict]:
@@ -1894,6 +2039,24 @@ def get_pending_delivery_chat_ids(
     return pending
 
 
+def mark_delivery_sending(
+    conn: sqlite3.Connection,
+    outbox_id: int,
+    chat_id: str,
+    page_number: int = 1,
+) -> None:
+    now_iso = datetime.now().isoformat()
+    with conn:
+        conn.execute(
+            """
+            UPDATE outbox_deliveries
+            SET status = 'sending', last_attempt_at = ?
+            WHERE outbox_id = ? AND page_number = ? AND chat_id = ?
+            """,
+            (now_iso, outbox_id, page_number, str(chat_id)),
+        )
+
+
 def record_delivery_attempt(
     conn: sqlite3.Connection,
     outbox_id: int,
@@ -1901,41 +2064,86 @@ def record_delivery_attempt(
     success: bool,
     error: str = "",
     page_number: int = 1,
+    status: str | None = None,
 ) -> None:
     now_iso = datetime.now().isoformat()
-    status = "sent" if success else "failed"
+    if status is None:
+        status = "sent" if success else "failed"
     with conn:
-        conn.execute(
-            """
-            UPDATE outbox_deliveries
-            SET status = ?, attempts = attempts + 1, last_attempt_at = ?, error_message = ?
-            WHERE outbox_id = ? AND page_number = ? AND chat_id = ?
-            """,
-            (status, now_iso, error, outbox_id, page_number, str(chat_id)),
-        )
         cur = conn.cursor()
+        cur.execute("PRAGMA table_info(outbox_deliveries)")
+        od_cols = {r[1] for r in cur.fetchall()}
+        has_sent_at = "sent_at" in od_cols
+
+        if has_sent_at:
+            conn.execute(
+                """
+                UPDATE outbox_deliveries
+                SET status = ?, attempts = attempts + 1, last_attempt_at = ?,
+                    sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END,
+                    error_message = ?
+                WHERE outbox_id = ? AND page_number = ? AND chat_id = ?
+                """,
+                (status, now_iso, status, now_iso, error, outbox_id, page_number, str(chat_id)),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE outbox_deliveries
+                SET status = ?, attempts = attempts + 1, last_attempt_at = ?, error_message = ?
+                WHERE outbox_id = ? AND page_number = ? AND chat_id = ?
+                """,
+                (status, now_iso, error, outbox_id, page_number, str(chat_id)),
+            )
+
         cur.execute("SELECT COUNT(*) FROM outbox_pages WHERE outbox_id = ?", (outbox_id,))
         has_pages = (cur.fetchone()[0] > 0)
         if not has_pages:
-            cur.execute(
-                """
-                SELECT COUNT(*) AS pending_cnt FROM outbox_deliveries
-                WHERE outbox_id = ? AND status != 'sent'
-                """,
-                (outbox_id,),
-            )
-            row = cur.fetchone()
-            all_sent = (row["pending_cnt"] == 0) if row else False
-            out_status = "sent" if all_sent else "failed"
-            conn.execute(
-                """
-                UPDATE outbox
-                SET status = ?, attempts = attempts + 1, last_attempt_at = ?,
-                    error_message = CASE WHEN ? THEN '' ELSE ? END
-                WHERE id = ?
-                """,
-                (out_status, now_iso, all_sent, error, outbox_id),
-            )
+            cur.execute("SELECT status FROM outbox_deliveries WHERE outbox_id = ?", (outbox_id,))
+            d_statuses = [r[0] for r in cur.fetchall()]
+            if any(s in ("pending", "sending") for s in d_statuses):
+                # Deliveries still in-flight to other recipients; preserve outbox status as 'sending'
+                return
+
+            all_sent = bool(d_statuses and all(s == "sent" for s in d_statuses))
+            has_ambiguous = any(s == "ambiguous" for s in d_statuses)
+
+            cur.execute("PRAGMA table_info(outbox)")
+            o_cols = {r[1] for r in cur.fetchall()}
+            has_o_sent_at = "sent_at" in o_cols
+
+            if all_sent:
+                out_status = "sent"
+            elif has_ambiguous:
+                out_status = "ambiguous"
+            else:
+                cur.execute("SELECT attempts FROM outbox WHERE id = ?", (outbox_id,))
+                att_row = cur.fetchone()
+                cur_att = att_row[0] if att_row else 0
+                out_status = "failed_final" if cur_att + 1 >= 3 else "failed"
+
+            if has_o_sent_at:
+                conn.execute(
+                    """
+                    UPDATE outbox
+                    SET status = ?, last_attempt_at = ?,
+                        sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END,
+                        error_message = CASE WHEN ? THEN '' ELSE ? END
+                    WHERE id = ?
+                    """,
+                    (out_status, now_iso, out_status, now_iso, all_sent, error, outbox_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE outbox
+                    SET status = ?, last_attempt_at = ?,
+                        error_message = CASE WHEN ? THEN '' ELSE ? END
+                    WHERE id = ?
+                    """,
+                    (out_status, now_iso, all_sent, error, outbox_id),
+                )
+
             if all_sent:
                 cur.execute("SELECT DISTINCT event_id, revision FROM outbox_events WHERE outbox_id = ?", (outbox_id,))
                 linked = cur.fetchall()
