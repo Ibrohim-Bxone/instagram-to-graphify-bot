@@ -21,6 +21,138 @@ def get_connection(db_path: Path | str) -> sqlite3.Connection:
     _init_schema(conn)
     return conn
 
+def _derive_consistent_outbox_and_page_statuses(conn: sqlite3.Connection) -> None:
+    """Derive consistent aggregate outbox and outbox_pages status from outbox_deliveries.
+
+    Preserves per recipient/page delivery evidence. Group signature/membership equivalence
+    alone cannot justify global/page 'sent' while any required recipient is pending or failed.
+    Does NOT turn ambiguous status into retry/success.
+    """
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox'")
+    if not cur.fetchone():
+        return
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox_deliveries'")
+    if not cur.fetchone():
+        return
+    cur.execute("PRAGMA table_info(outbox_deliveries)")
+    od_cols = {r[1] for r in cur.fetchall()}
+    has_page_col = "page_number" in od_cols
+
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox_pages'")
+    has_op = bool(cur.fetchone())
+
+    # Only process outbox rows that actually have delivery records
+    cur.execute("SELECT DISTINCT outbox_id FROM outbox_deliveries")
+    outbox_ids = [r[0] for r in cur.fetchall()]
+    if not outbox_ids:
+        return
+
+    for oid in outbox_ids:
+        cur.execute("SELECT status FROM outbox WHERE id = ?", (oid,))
+        row = cur.fetchone()
+        if not row:
+            continue
+        cur_out_status = row[0]
+
+        if has_op:
+            cur.execute("SELECT page_number, status FROM outbox_pages WHERE outbox_id = ? ORDER BY page_number", (oid,))
+            pages = cur.fetchall()
+        else:
+            pages = []
+
+        if pages:
+            for p_num, p_st in pages:
+                if has_page_col:
+                    cur.execute(
+                        "SELECT chat_id, status FROM outbox_deliveries WHERE outbox_id = ? AND page_number = ?",
+                        (oid, p_num),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT chat_id, status FROM outbox_deliveries WHERE outbox_id = ?",
+                        (oid,),
+                    )
+                delivs = cur.fetchall()
+                if not delivs:
+                    continue
+                chat_map: dict[str, set[str]] = {}
+                for cid, st in delivs:
+                    chat_map.setdefault(cid, set()).add(st)
+                eff_set = set()
+                for cid, st_set in chat_map.items():
+                    if "sent" in st_set:
+                        eff_set.add("sent")
+                    elif "ambiguous" in st_set:
+                        eff_set.add("ambiguous")
+                    elif "failed" in st_set:
+                        eff_set.add("failed")
+                    else:
+                        eff_set.add("pending")
+
+                if p_st in ("ambiguous", "sending"):
+                    new_p_st = "ambiguous"
+                elif "ambiguous" in eff_set:
+                    new_p_st = "ambiguous"
+                elif "failed" in eff_set:
+                    new_p_st = "failed"
+                elif "pending" in eff_set:
+                    new_p_st = "pending"
+                else:
+                    new_p_st = "sent"
+
+                if new_p_st != p_st:
+                    conn.execute(
+                        "UPDATE outbox_pages SET status = ? WHERE outbox_id = ? AND page_number = ?",
+                        (new_p_st, oid, p_num),
+                    )
+
+            cur.execute("SELECT status FROM outbox_pages WHERE outbox_id = ?", (oid,))
+            p_statuses = {r[0] for r in cur.fetchall()}
+            if cur_out_status in ("ambiguous", "sending"):
+                new_out_st = "ambiguous"
+            elif "ambiguous" in p_statuses:
+                new_out_st = "ambiguous"
+            elif "failed" in p_statuses:
+                new_out_st = "failed"
+            elif "pending" in p_statuses:
+                new_out_st = "pending"
+            else:
+                new_out_st = "sent"
+        else:
+            cur.execute("SELECT chat_id, status FROM outbox_deliveries WHERE outbox_id = ?", (oid,))
+            delivs = cur.fetchall()
+            if not delivs:
+                continue
+            chat_map = {}
+            for cid, st in delivs:
+                chat_map.setdefault(cid, set()).add(st)
+            eff_set = set()
+            for cid, st_set in chat_map.items():
+                if "sent" in st_set:
+                    eff_set.add("sent")
+                elif "ambiguous" in st_set:
+                    eff_set.add("ambiguous")
+                elif "failed" in st_set:
+                    eff_set.add("failed")
+                else:
+                    eff_set.add("pending")
+
+            if cur_out_status in ("ambiguous", "sending"):
+                new_out_st = "ambiguous"
+            elif "ambiguous" in eff_set:
+                new_out_st = "ambiguous"
+            elif "failed" in eff_set:
+                new_out_st = "failed"
+            elif "pending" in eff_set:
+                new_out_st = "pending"
+            else:
+                new_out_st = "sent"
+
+        if new_out_st != cur_out_status:
+            conn.execute("UPDATE outbox SET status = ? WHERE id = ?", (new_out_st, oid))
+
+
 def collapse_outbox_duplicates(conn: sqlite3.Connection) -> list[dict]:
     """Migrate legacy outbox rows and collapse duplicate rows on startup.
 
@@ -52,6 +184,46 @@ def collapse_outbox_duplicates(conn: sqlite3.Connection) -> list[dict]:
     if not rows:
         return []
 
+    # Pre-fetch existing outbox_events and outbox_pages for accurate membership & payload grouping
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox_events'")
+    has_oe = bool(cur.fetchone())
+    outbox_events_by_id: dict[int, list[tuple[str, int]]] = {}
+    oe_has_rev = False
+    if has_oe:
+        cur.execute("PRAGMA table_info(outbox_events)")
+        oe_cols = {r[1] for r in cur.fetchall()}
+        oe_has_rev = "revision" in oe_cols
+        if oe_has_rev:
+            cur.execute("SELECT outbox_id, event_id, revision FROM outbox_events ORDER BY outbox_id, event_id, revision")
+            for oid, mid, mrev in cur.fetchall():
+                outbox_events_by_id.setdefault(oid, []).append((mid, mrev))
+        else:
+            cur.execute("SELECT outbox_id, event_id, 1 FROM outbox_events ORDER BY outbox_id, event_id")
+            for oid, mid, mrev in cur.fetchall():
+                outbox_events_by_id.setdefault(oid, []).append((mid, mrev))
+
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox_pages'")
+    has_op = bool(cur.fetchone())
+    outbox_pages_by_id: dict[int, list[tuple]] = {}
+    if has_op:
+        cur.execute("PRAGMA table_info(outbox_pages)")
+        op_cols = {r[1] for r in cur.fetchall()}
+        has_mids = "member_ids_json" in op_cols
+        if has_mids:
+            cur.execute("SELECT outbox_id, page_number, rendered_text, member_ids_json FROM outbox_pages ORDER BY outbox_id, page_number")
+        else:
+            cur.execute("SELECT outbox_id, page_number, rendered_text, '[]' FROM outbox_pages ORDER BY outbox_id, page_number")
+        for oid, pnum, ptext, pmids in cur.fetchall():
+            outbox_pages_by_id.setdefault(oid, []).append((pnum, ptext or "", pmids or ""))
+
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox_deliveries'")
+    has_od = bool(cur.fetchone())
+    has_page_col = False
+    if has_od:
+        cur.execute("PRAGMA table_info(outbox_deliveries)")
+        od_cols = {r[1] for r in cur.fetchall()}
+        has_page_col = "page_number" in od_cols
+
     # For legacy items of the same event_id, find the earliest row's revision so that
     # duplicates of the same item share the same target_key
     legacy_earliest_rev: dict[str, int] = {}
@@ -62,6 +234,74 @@ def collapse_outbox_duplicates(conn: sqlite3.Connection) -> list[dict]:
                 if eid not in legacy_earliest_rev:
                     legacy_earliest_rev[eid] = r.get("revision") or 1
 
+    # Group legacy digest rows by date.
+    # Defect 2: Only truly identical content AND membership can collapse. Keep different legacy payload/member sets distinct with stable unique legacy keys.
+    # When multiple pending rows exist for the same pending digest with empty membership, they are un-sent drafts that collapse into the newest pending row.
+    legacy_digest_rows_by_date: dict[str, list[dict]] = {}
+    for r in rows:
+        if not r.get("key"):
+            eid = r.get("event_id") or ""
+            if eid == "digest" or eid.startswith("digest:"):
+                d_str = eid.removeprefix("digest:")[:10] if eid.startswith("digest:") else (r.get("created_at") or "legacy")[:10]
+                r_text = (r.get("rendered_text") or "").strip()
+                r_events = tuple(outbox_events_by_id.get(r["id"], []))
+                r_pages = tuple(outbox_pages_by_id.get(r["id"], []))
+                r["_sig"] = (r_text, r_events, r_pages)
+                r["_events"] = r_events
+                r["_date_str"] = d_str
+                legacy_digest_rows_by_date.setdefault(d_str, []).append(r)
+
+    # For each date, partition rows into equivalence classes that can collapse together
+    assigned_digest_keys: dict[int, str] = {}
+    for d_str, d_rows in legacy_digest_rows_by_date.items():
+        d_groups: list[list[dict]] = []
+        for r in d_rows:
+            matched = False
+            for grp in d_groups:
+                first = grp[0]
+                if r["_sig"] == first["_sig"] or (
+                    r.get("status") == "pending" and first.get("status") == "pending" and not r["_events"] and not first["_events"]
+                ):
+                    grp.append(r)
+                    matched = True
+                    break
+            if not matched:
+                d_groups.append([r])
+
+        existing_keyed = next((x for x in rows if x.get("key") == f"digest:{d_str}"), None)
+        existing_sig = None
+        if existing_keyed:
+            ex_text = (existing_keyed.get("rendered_text") or "").strip()
+            ex_events = tuple(outbox_events_by_id.get(existing_keyed["id"], []))
+            ex_pages = tuple(outbox_pages_by_id.get(existing_keyed["id"], []))
+            existing_sig = (ex_text, ex_events, ex_pages)
+
+        def _group_priority(glist: list[dict]) -> tuple[int, str, int]:
+            has_sent = any(x["status"] == "sent" for x in glist)
+            earliest_created = min((x.get("created_at") or "") for x in glist)
+            min_id = min(x["id"] for x in glist)
+            return (0 if has_sent else 1, earliest_created, min_id)
+
+        sorted_groups = sorted(d_groups, key=_group_priority)
+        canonical_assigned = False
+
+        for glist in sorted_groups:
+            min_id = min(x["id"] for x in glist)
+            first_sig = glist[0]["_sig"]
+            if existing_keyed is not None:
+                if first_sig == existing_sig:
+                    t_k = f"digest:{d_str}"
+                else:
+                    t_k = f"legacy:digest:{d_str}:{min_id}"
+            else:
+                if not canonical_assigned:
+                    t_k = f"digest:{d_str}"
+                    canonical_assigned = True
+                else:
+                    t_k = f"legacy:digest:{d_str}:{min_id}"
+            for item in glist:
+                assigned_digest_keys[item["id"]] = t_k
+
     # Calculate target key and was_legacy in Python first (do NOT update DB yet)
     for r in rows:
         r["was_legacy"] = not bool(r.get("key"))
@@ -71,11 +311,8 @@ def collapse_outbox_duplicates(conn: sqlite3.Connection) -> list[dict]:
             k = r["key"]
         elif eid.startswith("merged_high"):
             k = f"legacy:{eid}:{r['id']}"
-        elif eid == "digest":
-            date_str = (r.get("created_at") or "legacy")[:10]
-            k = f"digest:{date_str}"
-        elif eid.startswith("digest:"):
-            k = eid
+        elif r["id"] in assigned_digest_keys:
+            k = assigned_digest_keys[r["id"]]
         elif eid.startswith("probe:"):
             k = eid
         else:
@@ -113,32 +350,94 @@ def collapse_outbox_duplicates(conn: sqlite3.Connection) -> list[dict]:
                     group.sort(key=lambda r: (r.get("created_at") or "", r["id"]), reverse=True)
                     kept = group[0]
 
+            # Preserve all ambiguous/sending evidence from every row and page in group before deleting/re-pointing
+            ambig_pages = set()
+            for r in group:
+                r_id = r["id"]
+                r_is_ambig = r.get("status") in ("ambiguous", "sending")
+                if r_is_ambig:
+                    if has_od:
+                        conn.execute(
+                            "UPDATE outbox_deliveries SET status = 'ambiguous' WHERE outbox_id = ? AND status IN ('pending', 'sending')",
+                            (r_id,),
+                        )
+                if has_op:
+                    cur.execute(
+                        "SELECT page_number, status FROM outbox_pages WHERE outbox_id = ?",
+                        (r_id,),
+                    )
+                    for p_num, p_st in cur.fetchall():
+                        if p_st in ("ambiguous", "sending") or r_is_ambig:
+                            ambig_pages.add(p_num)
+                            if has_page_col:
+                                conn.execute(
+                                    "UPDATE outbox_deliveries SET status = 'ambiguous' WHERE outbox_id = ? AND page_number = ? AND status IN ('pending', 'sending')",
+                                    (r_id, p_num),
+                                )
+
+            if has_op and ambig_pages:
+                for p_num in ambig_pages:
+                    conn.execute(
+                        "UPDATE outbox_pages SET status = 'ambiguous' WHERE outbox_id = ? AND page_number = ?",
+                        (kept["id"], p_num),
+                    )
+
+            group_has_ambig = any(r.get("status") in ("ambiguous", "sending") for r in group) or bool(ambig_pages)
+            if group_has_ambig and kept["status"] != "ambiguous":
+                conn.execute("UPDATE outbox SET status = 'ambiguous' WHERE id = ?", (kept["id"],))
+                kept["status"] = "ambiguous"
+
             to_remove = [r for r in group if r["id"] != kept["id"]]
             for r in to_remove:
                 remove_id = r["id"]
-                # Merge deliveries: never delete a recipient's sent delivery record!
-                cur.execute("SELECT chat_id, status, attempts, last_attempt_at, error_message FROM outbox_deliveries WHERE outbox_id = ?", (remove_id,))
-                delivs = cur.fetchall()
-                for d in delivs:
-                    cid, d_st = d["chat_id"], d["status"]
-                    cur.execute("SELECT status FROM outbox_deliveries WHERE outbox_id = ? AND chat_id = ?", (kept["id"], cid))
-                    existing_d = cur.fetchone()
-                    if not existing_d:
-                        conn.execute("UPDATE outbox_deliveries SET outbox_id = ? WHERE outbox_id = ? AND chat_id = ?", (kept["id"], remove_id, cid))
-                    else:
-                        if d_st == "sent" and existing_d["status"] != "sent":
-                            conn.execute("UPDATE outbox_deliveries SET status = 'sent', error_message = '' WHERE outbox_id = ? AND chat_id = ?", (kept["id"], cid))
-                        conn.execute("DELETE FROM outbox_deliveries WHERE outbox_id = ? AND chat_id = ?", (remove_id, cid))
+                # Re-point delivery records to kept outbox row without deleting any delivery record
+                conn.execute("UPDATE outbox_deliveries SET outbox_id = ? WHERE outbox_id = ?", (kept["id"], remove_id))
 
-                # Merge outbox_events into kept row
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO outbox_events (outbox_id, event_id, revision)
-                    SELECT ?, event_id, revision FROM outbox_events WHERE outbox_id = ?
-                    """,
-                    (kept["id"], remove_id),
-                )
-                conn.execute("DELETE FROM outbox_events WHERE outbox_id = ?", (remove_id,))
+                # Preserve outbox_pages for kept row
+                if has_op:
+                    conn.execute(
+                        """
+                        DELETE FROM outbox_pages
+                        WHERE outbox_id = ?
+                          AND page_number IN (
+                              SELECT page_number FROM outbox_pages WHERE outbox_id = ?
+                          )
+                        """,
+                        (remove_id, kept["id"]),
+                    )
+                    conn.execute("UPDATE outbox_pages SET outbox_id = ? WHERE outbox_id = ?", (kept["id"], remove_id))
+                    if r.get("status") in ("ambiguous", "sending"):
+                        conn.execute(
+                            "UPDATE outbox_pages SET status = 'ambiguous' WHERE outbox_id = ? AND status IN ('pending', 'sending')",
+                            (kept["id"],),
+                        )
+
+                # Merge outbox_events into kept row transactionally without conflict with idx_outbox_events_member
+                if has_oe:
+                    if oe_has_rev:
+                        conn.execute(
+                            """
+                            DELETE FROM outbox_events
+                            WHERE outbox_id = ?
+                              AND (event_id, revision) IN (
+                                  SELECT event_id, revision FROM outbox_events WHERE outbox_id = ?
+                              )
+                            """,
+                            (remove_id, kept["id"]),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            DELETE FROM outbox_events
+                            WHERE outbox_id = ?
+                              AND event_id IN (
+                                  SELECT event_id FROM outbox_events WHERE outbox_id = ?
+                              )
+                            """,
+                            (remove_id, kept["id"]),
+                        )
+                    conn.execute("UPDATE outbox_events SET outbox_id = ? WHERE outbox_id = ?", (kept["id"], remove_id))
+
                 conn.execute("DELETE FROM outbox WHERE id = ?", (remove_id,))
                 collapsed_records.append(r)
 
@@ -155,22 +454,12 @@ def collapse_outbox_duplicates(conn: sqlite3.Connection) -> list[dict]:
                 conn.execute("UPDATE outbox SET key = ? WHERE id = ?", (r["target_key"], r["id"]))
                 r["key"] = r["target_key"]
 
-        # Ensure no duplicate (event_id, revision) exist in outbox_events before unique index
-        conn.execute(
-            """
-            DELETE FROM outbox_events
-            WHERE rowid NOT IN (
-                SELECT MIN(oe.rowid)
-                FROM outbox_events oe
-                JOIN outbox o ON o.id = oe.outbox_id
-                GROUP BY oe.event_id, oe.revision
-            )
-            """
-        )
-
         # Ensure indexes exist
         conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_event_kind ON outbox(event_id, kind)")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_key ON outbox(key)")
+
+        # Step 3: Derive consistent aggregate status for outbox and outbox_pages from outbox_deliveries
+        _derive_consistent_outbox_and_page_statuses(conn)
 
     return collapsed_records
 
@@ -242,19 +531,22 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             );
 
             CREATE TABLE IF NOT EXISTS outbox_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 outbox_id INTEGER,
+                page_number INTEGER DEFAULT 1,
                 chat_id TEXT,
                 status TEXT DEFAULT 'pending',
                 attempts INTEGER DEFAULT 0,
                 last_attempt_at TEXT DEFAULT '',
-                error_message TEXT DEFAULT '',
-                PRIMARY KEY (outbox_id, chat_id)
+                error_message TEXT DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS event_notifications (
-                event_id TEXT PRIMARY KEY,
+                event_id TEXT,
+                revision INTEGER DEFAULT 1,
                 status TEXT DEFAULT 'pending',
-                notified_at TEXT
+                notified_at TEXT,
+                PRIMARY KEY (event_id, revision)
             );
 
             CREATE TABLE IF NOT EXISTS outbox_events (
@@ -320,6 +612,9 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             ("key", "TEXT"),
             ("revision", "INTEGER DEFAULT 1"),
             ("kind", "TEXT DEFAULT ''"),
+            ("attempts", "INTEGER DEFAULT 0"),
+            ("last_attempt_at", "TEXT DEFAULT ''"),
+            ("error_message", "TEXT DEFAULT ''"),
         ]:
             if col not in out_cols:
                 try:
@@ -372,18 +667,102 @@ def _init_schema(conn: sqlite3.Connection) -> None:
 
         cur.execute("PRAGMA table_info(outbox_pages)")
         op_cols = {row[1] for row in cur.fetchall()}
-        if "member_ids_json" not in op_cols:
-            try:
-                conn.execute("ALTER TABLE outbox_pages ADD COLUMN member_ids_json TEXT DEFAULT '[]'")
-            except Exception:
-                pass
+        for col, col_type in [
+            ("attempts", "INTEGER DEFAULT 0"),
+            ("last_attempt_at", "TEXT DEFAULT ''"),
+            ("error_message", "TEXT DEFAULT ''"),
+            ("member_ids_json", "TEXT DEFAULT '[]'"),
+        ]:
+            if col not in op_cols:
+                try:
+                    conn.execute(f"ALTER TABLE outbox_pages ADD COLUMN {col} {col_type}")
+                except Exception:
+                    pass
 
-        # Step 3: Migrate legacy rows and collapse duplicates
-        collapse_outbox_duplicates(conn)
+        cur.execute("PRAGMA table_info(outbox_deliveries)")
+        od_cols = {row[1] for row in cur.fetchall()}
+        if "page_number" not in od_cols or "id" not in od_cols:
+            conn.execute("ALTER TABLE outbox_deliveries RENAME TO outbox_deliveries_old")
+            conn.execute(
+                """
+                CREATE TABLE outbox_deliveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    outbox_id INTEGER,
+                    page_number INTEGER DEFAULT 1,
+                    chat_id TEXT,
+                    status TEXT DEFAULT 'pending',
+                    attempts INTEGER DEFAULT 0,
+                    last_attempt_at TEXT DEFAULT '',
+                    error_message TEXT DEFAULT ''
+                )
+                """
+            )
+            cur.execute("PRAGMA table_info(outbox_deliveries_old)")
+            old_od_cols = {r[1] for r in cur.fetchall()}
+            if "page_number" in old_od_cols:
+                conn.execute(
+                    """
+                    INSERT INTO outbox_deliveries (outbox_id, page_number, chat_id, status, attempts, last_attempt_at, error_message)
+                    SELECT outbox_id, page_number, chat_id, status, attempts, last_attempt_at, error_message FROM outbox_deliveries_old
+                    """
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO outbox_deliveries (outbox_id, page_number, chat_id, status, attempts, last_attempt_at, error_message)
+                    SELECT outbox_id, 1, chat_id, status, attempts, last_attempt_at, error_message FROM outbox_deliveries_old
+                    """
+                )
+            conn.execute("DROP TABLE outbox_deliveries_old")
 
-        # Step 4: Startup recovery: mark any outbox rows left in 'sending' as 'ambiguous'
+        cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='event_notifications'")
+        en_row = cur.fetchone()
+        if en_row and "PRIMARY KEY" in en_row[0].upper() and "REVISION" not in en_row[0].upper():
+            conn.execute("ALTER TABLE event_notifications RENAME TO event_notifications_old")
+            conn.execute(
+                """
+                CREATE TABLE event_notifications (
+                    event_id TEXT,
+                    revision INTEGER DEFAULT 1,
+                    status TEXT DEFAULT 'pending',
+                    notified_at TEXT,
+                    PRIMARY KEY (event_id, revision)
+                )
+                """
+            )
+            cur.execute("PRAGMA table_info(event_notifications_old)")
+            old_en_cols = {r[1] for r in cur.fetchall()}
+            if "revision" in old_en_cols:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO event_notifications (event_id, revision, status, notified_at)
+                    SELECT event_id, revision, status, notified_at FROM event_notifications_old
+                    """
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO event_notifications (event_id, revision, status, notified_at)
+                    SELECT event_id, 1, status, notified_at FROM event_notifications_old
+                    """
+                )
+            conn.execute("DROP TABLE event_notifications_old")
+
+        # Step 3: Startup recovery: mark any outbox rows, pages, and deliveries left in 'sending' as 'ambiguous'
         conn.execute("UPDATE outbox SET status = 'ambiguous' WHERE status = 'sending'")
         conn.execute("UPDATE outbox_pages SET status = 'ambiguous' WHERE status = 'sending'")
+        conn.execute("UPDATE outbox_deliveries SET status = 'ambiguous' WHERE status = 'sending'")
+        conn.execute(
+            """
+            UPDATE outbox_deliveries
+            SET status = 'ambiguous'
+            WHERE status IN ('pending', 'sending')
+              AND outbox_id IN (SELECT id FROM outbox WHERE status = 'ambiguous')
+            """
+        )
+
+        # Step 4: Migrate legacy rows and collapse duplicates
+        collapse_outbox_duplicates(conn)
 
         # Step 5: Create all indexes
         conn.executescript(
@@ -393,6 +772,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status);
             CREATE INDEX IF NOT EXISTS idx_processing_jobs_status ON processing_jobs(status);
             CREATE INDEX IF NOT EXISTS idx_outbox_deliveries_status ON outbox_deliveries(status);
+            CREATE INDEX IF NOT EXISTS idx_outbox_deliveries_outbox_page ON outbox_deliveries(outbox_id, page_number);
             CREATE INDEX IF NOT EXISTS idx_outbox_events_event ON outbox_events(event_id);
             CREATE INDEX IF NOT EXISTS idx_outbox_events_outbox ON outbox_events(outbox_id);
             CREATE INDEX IF NOT EXISTS idx_probe_snapshots_name ON probe_snapshots(probe_name, id DESC);
@@ -643,11 +1023,11 @@ def record_unseen_entries(
                     )
                     conn.execute(
                         """
-                        UPDATE event_notifications
-                        SET status = 'pending', notified_at = ?
-                        WHERE event_id = ?
+                        INSERT INTO event_notifications (event_id, revision, status, notified_at)
+                        VALUES (?, ?, 'pending', ?)
+                        ON CONFLICT(event_id, revision) DO UPDATE SET status = 'pending', notified_at = excluded.notified_at
                         """,
-                        (now_iso, event_id),
+                        (event_id, new_rev, now_iso),
                     )
                     new_events.append({
                         "id": event_id,
@@ -759,7 +1139,10 @@ def add_to_outbox(
             for p_idx, page_item in enumerate(pages, 1):
                 if isinstance(page_item, tuple):
                     p_msg = page_item[0]
-                    p_mids = [it[0]["id"] for it in page_item[1] if it[0].get("id")]
+                    p_mids = []
+                    for it in page_item[1]:
+                        item_ev = it[0]
+                        p_mids.extend(item_ev.get("member_ids") or [item_ev["id"]])
                 else:
                     p_msg = str(page_item)
                     p_mids = []
@@ -777,15 +1160,35 @@ def add_to_outbox(
 
         if member_events:
             for ev in member_events:
-                mid = ev["id"]
-                mrev = ev.get("revision", 1)
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO outbox_events (outbox_id, event_id, revision)
-                    VALUES (?, ?, ?)
-                    """,
-                    (out_id, mid, mrev),
-                )
+                if "member_items" in ev and ev["member_items"]:
+                    for mid, mrev in ev["member_items"]:
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO outbox_events (outbox_id, event_id, revision)
+                            VALUES (?, ?, ?)
+                            """,
+                            (out_id, mid, mrev),
+                        )
+                elif "member_revisions" in ev and ev["member_revisions"]:
+                    for mid, mrev in ev["member_revisions"].items():
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO outbox_events (outbox_id, event_id, revision)
+                            VALUES (?, ?, ?)
+                            """,
+                            (out_id, mid, mrev),
+                        )
+                else:
+                    mids = ev.get("member_ids") or [ev["id"]]
+                    mrev = ev.get("revision", 1)
+                    for mid in mids:
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO outbox_events (outbox_id, event_id, revision)
+                            VALUES (?, ?, ?)
+                            """,
+                            (out_id, mid, mrev),
+                        )
 
         return out_id
 
@@ -891,8 +1294,15 @@ def is_event_already_sent(
         if cur.fetchone():
             return True
 
-    # 4. Event notifications table (only checked if revision is None or revision <= 1)
-    if revision is None or revision <= 1:
+    # 4. Event notifications table
+    if revision is not None:
+        cur.execute(
+            "SELECT 1 FROM event_notifications WHERE event_id = ? AND revision = ? AND status = 'sent' LIMIT 1",
+            (event_id, revision),
+        )
+        if cur.fetchone():
+            return True
+    else:
         cur.execute(
             "SELECT 1 FROM event_notifications WHERE event_id = ? AND status = 'sent' LIMIT 1",
             (event_id,),
@@ -968,22 +1378,69 @@ def increment_processing_job_attempts(
     return increment_enrichment_attempts(conn, event_id, revision)
 
 
+def get_enrichment_attempts(
+    conn: sqlite3.Connection, event_id: str, revision: int = 1
+) -> int:
+    """Return enrichment failure attempts for (event_id, revision)."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT attempts FROM processing_jobs WHERE event_id = ? AND revision = ?",
+        (event_id, revision),
+    )
+    row = cur.fetchone()
+    return row[0] if row else 0
+
+
+def downgrade_event_to_digest(
+    conn: sqlite3.Connection, event_id: str, revision: int = 1
+) -> None:
+    """Persist downgrade of a high-priority event to digest after enrichment exhaustion."""
+    with conn:
+        conn.execute(
+            """
+            UPDATE events
+            SET priority = 'digest'
+            WHERE id = ? AND revision = ?
+            """,
+            (event_id, revision),
+        )
+
+
 def link_outbox_events(
     conn: sqlite3.Connection, outbox_id: int, events: list[dict]
 ) -> None:
     """Link member events and their revisions to an outbox entry."""
     with conn:
         for ev in events:
-            member_ids = ev.get("member_ids") or [ev["id"]]
-            rev = ev.get("revision", 1)
-            for mid in member_ids:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO outbox_events (outbox_id, event_id, revision)
-                    VALUES (?, ?, ?)
-                    """,
-                    (outbox_id, mid, rev),
-                )
+            if "member_items" in ev and ev["member_items"]:
+                for mid, mrev in ev["member_items"]:
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO outbox_events (outbox_id, event_id, revision)
+                        VALUES (?, ?, ?)
+                        """,
+                        (outbox_id, mid, mrev),
+                    )
+            elif "member_revisions" in ev and ev["member_revisions"]:
+                for mid, mrev in ev["member_revisions"].items():
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO outbox_events (outbox_id, event_id, revision)
+                        VALUES (?, ?, ?)
+                        """,
+                        (outbox_id, mid, mrev),
+                    )
+            else:
+                member_ids = ev.get("member_ids") or [ev["id"]]
+                rev = ev.get("revision", 1)
+                for mid in member_ids:
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO outbox_events (outbox_id, event_id, revision)
+                        VALUES (?, ?, ?)
+                        """,
+                        (outbox_id, mid, rev),
+                    )
 
 
 def find_existing_outbox_for_events(
@@ -992,10 +1449,15 @@ def find_existing_outbox_for_events(
     """Check if an outbox entry already exists that covers all member events for their current revisions."""
     all_mids: list[tuple[str, int]] = []
     for ev in events:
-        mids = ev.get("member_ids") or [ev["id"]]
-        rev = ev.get("revision", 1)
-        for mid in mids:
-            all_mids.append((mid, rev))
+        if "member_items" in ev and ev["member_items"]:
+            all_mids.extend(ev["member_items"])
+        elif "member_revisions" in ev and ev["member_revisions"]:
+            all_mids.extend(ev["member_revisions"].items())
+        else:
+            mids = ev.get("member_ids") or [ev["id"]]
+            rev = ev.get("revision", 1)
+            for mid in mids:
+                all_mids.append((mid, rev))
     if not all_mids:
         return None
 
@@ -1041,21 +1503,42 @@ def update_outbox_status(
 ) -> None:
     now_iso = datetime.now().isoformat()
     with conn:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(outbox)")
+        cols = {r[1] for r in cur.fetchall()}
+        has_last = "last_attempt_at" in cols
+
         if status == "sending":
-            conn.execute(
-                "UPDATE outbox SET status = 'sending', last_attempt_at = ? WHERE id = ?",
-                (now_iso, outbox_id),
-            )
+            if has_last:
+                conn.execute(
+                    "UPDATE outbox SET status = 'sending', last_attempt_at = ? WHERE id = ?",
+                    (now_iso, outbox_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE outbox SET status = 'sending' WHERE id = ?",
+                    (outbox_id,),
+                )
             return
 
-        conn.execute(
-            """
-            UPDATE outbox
-            SET status = ?, attempts = attempts + 1, last_attempt_at = ?, error_message = ?
-            WHERE id = ?
-            """,
-            (status, now_iso, error_message, outbox_id),
-        )
+        if has_last:
+            conn.execute(
+                """
+                UPDATE outbox
+                SET status = ?, attempts = attempts + 1, last_attempt_at = ?, error_message = ?
+                WHERE id = ?
+                """,
+                (status, now_iso, error_message, outbox_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE outbox
+                SET status = ?, attempts = attempts + 1
+                WHERE id = ?
+                """,
+                (status, outbox_id),
+            )
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM outbox_pages WHERE outbox_id = ?", (outbox_id,))
         has_pages = (cur.fetchone()[0] > 0)
@@ -1071,15 +1554,15 @@ def update_outbox_status(
             for mid, mrev in linked:
                 conn.execute(
                     """
-                    INSERT INTO event_notifications (event_id, status, notified_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(event_id) DO UPDATE SET status = excluded.status, notified_at = excluded.notified_at
+                    INSERT INTO event_notifications (event_id, revision, status, notified_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(event_id, revision) DO UPDATE SET status = excluded.status, notified_at = excluded.notified_at
                     """,
-                    (mid, status, now_iso),
+                    (mid, mrev or 1, status, now_iso),
                 )
                 conn.execute(
-                    "UPDATE events SET status = ? WHERE id = ?",
-                    (status, mid),
+                    "UPDATE events SET status = ? WHERE id = ? AND revision = ?",
+                    (status, mid, mrev or 1),
                 )
 
 
@@ -1101,14 +1584,23 @@ def mark_outbox_page_status(
 ) -> None:
     now_iso = datetime.now().isoformat()
     with conn:
-        conn.execute(
-            """
-            UPDATE outbox_pages
-            SET status = ?, last_attempt_at = ?
-            WHERE outbox_id = ? AND page_number = ?
-            """,
-            (status, now_iso, outbox_id, page_number),
-        )
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(outbox_pages)")
+        cols = {r[1] for r in cur.fetchall()}
+        if "last_attempt_at" in cols:
+            conn.execute(
+                """
+                UPDATE outbox_pages
+                SET status = ?, last_attempt_at = ?
+                WHERE outbox_id = ? AND page_number = ?
+                """,
+                (status, now_iso, outbox_id, page_number),
+            )
+        else:
+            conn.execute(
+                "UPDATE outbox_pages SET status = ? WHERE outbox_id = ? AND page_number = ?",
+                (status, outbox_id, page_number),
+            )
 
 
 def mark_outbox_page_sent(
@@ -1116,15 +1608,23 @@ def mark_outbox_page_sent(
 ) -> None:
     now_iso = datetime.now().isoformat()
     with conn:
-        conn.execute(
-            """
-            UPDATE outbox_pages
-            SET status = 'sent', last_attempt_at = ?, error_message = ''
-            WHERE outbox_id = ? AND page_number = ?
-            """,
-            (now_iso, outbox_id, page_number),
-        )
         cur = conn.cursor()
+        cur.execute("PRAGMA table_info(outbox_pages)")
+        cols = {r[1] for r in cur.fetchall()}
+        if "last_attempt_at" in cols:
+            conn.execute(
+                """
+                UPDATE outbox_pages
+                SET status = 'sent', last_attempt_at = ?, error_message = ''
+                WHERE outbox_id = ? AND page_number = ?
+                """,
+                (now_iso, outbox_id, page_number),
+            )
+        else:
+            conn.execute(
+                "UPDATE outbox_pages SET status = 'sent' WHERE outbox_id = ? AND page_number = ?",
+                (outbox_id, page_number),
+            )
         cur.execute(
             "SELECT member_ids_json FROM outbox_pages WHERE outbox_id = ? AND page_number = ?",
             (outbox_id, page_number),
@@ -1134,15 +1634,21 @@ def mark_outbox_page_sent(
             try:
                 mids = json.loads(row[0])
                 for mid in mids:
+                    cur.execute(
+                        "SELECT revision FROM outbox_events WHERE outbox_id = ? AND event_id = ? LIMIT 1",
+                        (outbox_id, mid),
+                    )
+                    rev_row = cur.fetchone()
+                    mrev = rev_row[0] if rev_row else 1
                     conn.execute(
                         """
-                        INSERT INTO event_notifications (event_id, status, notified_at)
-                        VALUES (?, 'sent', ?)
-                        ON CONFLICT(event_id) DO UPDATE SET status = 'sent', notified_at = excluded.notified_at
+                        INSERT INTO event_notifications (event_id, revision, status, notified_at)
+                        VALUES (?, ?, 'sent', ?)
+                        ON CONFLICT(event_id, revision) DO UPDATE SET status = 'sent', notified_at = excluded.notified_at
                         """,
-                        (mid, now_iso),
+                        (mid, mrev, now_iso),
                     )
-                    conn.execute("UPDATE events SET status = 'sent' WHERE id = ?", (mid,))
+                    conn.execute("UPDATE events SET status = 'sent' WHERE id = ? AND revision = ?", (mid, mrev))
             except Exception:
                 pass
 
@@ -1152,14 +1658,23 @@ def mark_outbox_page_failed(
 ) -> None:
     now_iso = datetime.now().isoformat()
     with conn:
-        conn.execute(
-            """
-            UPDATE outbox_pages
-            SET status = 'failed', attempts = attempts + 1, last_attempt_at = ?, error_message = ?
-            WHERE outbox_id = ? AND page_number = ?
-            """,
-            (now_iso, error, outbox_id, page_number),
-        )
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(outbox_pages)")
+        cols = {r[1] for r in cur.fetchall()}
+        if "last_attempt_at" in cols:
+            conn.execute(
+                """
+                UPDATE outbox_pages
+                SET status = 'failed', attempts = attempts + 1, last_attempt_at = ?, error_message = ?
+                WHERE outbox_id = ? AND page_number = ?
+                """,
+                (now_iso, error, outbox_id, page_number),
+            )
+        else:
+            conn.execute(
+                "UPDATE outbox_pages SET status = 'failed' WHERE outbox_id = ? AND page_number = ?",
+                (outbox_id, page_number),
+            )
         cur = conn.cursor()
         cur.execute(
             "SELECT member_ids_json FROM outbox_pages WHERE outbox_id = ? AND page_number = ?",
@@ -1170,15 +1685,21 @@ def mark_outbox_page_failed(
             try:
                 mids = json.loads(row[0])
                 for mid in mids:
+                    cur.execute(
+                        "SELECT revision FROM outbox_events WHERE outbox_id = ? AND event_id = ? LIMIT 1",
+                        (outbox_id, mid),
+                    )
+                    rev_row = cur.fetchone()
+                    mrev = rev_row[0] if rev_row else 1
                     conn.execute(
                         """
-                        INSERT INTO event_notifications (event_id, status, notified_at)
-                        VALUES (?, 'failed', ?)
-                        ON CONFLICT(event_id) DO UPDATE SET status = 'failed', notified_at = excluded.notified_at
+                        INSERT INTO event_notifications (event_id, revision, status, notified_at)
+                        VALUES (?, ?, 'failed', ?)
+                        ON CONFLICT(event_id, revision) DO UPDATE SET status = 'failed', notified_at = excluded.notified_at
                         """,
-                        (mid, now_iso),
+                        (mid, mrev, now_iso),
                     )
-                    conn.execute("UPDATE events SET status = 'failed' WHERE id = ?", (mid,))
+                    conn.execute("UPDATE events SET status = 'failed' WHERE id = ? AND revision = ?", (mid, mrev))
             except Exception:
                 pass
 
@@ -1199,6 +1720,17 @@ def mark_sending_outbox_ambiguous(conn: sqlite3.Connection) -> int:
         cur.execute("UPDATE outbox SET status = 'ambiguous' WHERE status = 'sending'")
         cnt = cur.rowcount
         conn.execute("UPDATE outbox_pages SET status = 'ambiguous' WHERE status = 'sending'")
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='outbox_deliveries'")
+        if cur.fetchone():
+            conn.execute("UPDATE outbox_deliveries SET status = 'ambiguous' WHERE status = 'sending'")
+            conn.execute(
+                """
+                UPDATE outbox_deliveries
+                SET status = 'ambiguous'
+                WHERE status IN ('pending', 'sending')
+                  AND outbox_id IN (SELECT id FROM outbox WHERE status = 'ambiguous')
+                """
+            )
         return cnt
 
 
@@ -1319,32 +1851,47 @@ def set_app_state(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def init_outbox_deliveries(
-    conn: sqlite3.Connection, outbox_id: int, chat_ids: list[str]
+    conn: sqlite3.Connection, outbox_id: int, chat_ids: list[str], page_number: int = 1
 ) -> None:
     with conn:
         for cid in chat_ids:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO outbox_deliveries (outbox_id, chat_id, status)
-                VALUES (?, ?, 'pending')
-                """,
-                (outbox_id, str(cid)),
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT 1 FROM outbox_deliveries WHERE outbox_id = ? AND page_number = ? AND chat_id = ? LIMIT 1",
+                (outbox_id, page_number, str(cid)),
             )
+            if not cur.fetchone():
+                conn.execute(
+                    """
+                    INSERT INTO outbox_deliveries (outbox_id, page_number, chat_id, status)
+                    VALUES (?, ?, ?, 'pending')
+                    """,
+                    (outbox_id, page_number, str(cid)),
+                )
 
 
 def get_pending_delivery_chat_ids(
-    conn: sqlite3.Connection, outbox_id: int
+    conn: sqlite3.Connection, outbox_id: int, page_number: int = 1
 ) -> list[str]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT chat_id FROM outbox_deliveries
-        WHERE outbox_id = ? AND status != 'sent'
+        SELECT DISTINCT chat_id FROM outbox_deliveries
+        WHERE outbox_id = ? AND page_number = ? AND status IN ('pending', 'failed')
         ORDER BY chat_id ASC
         """,
-        (outbox_id,),
+        (outbox_id, page_number),
     )
-    return [str(r["chat_id"]) for r in cur.fetchall()]
+    candidates = [str(r["chat_id"]) for r in cur.fetchall()]
+    pending = []
+    for cid in candidates:
+        cur.execute(
+            "SELECT 1 FROM outbox_deliveries WHERE outbox_id = ? AND page_number = ? AND chat_id = ? AND status IN ('sent', 'ambiguous') LIMIT 1",
+            (outbox_id, page_number, cid),
+        )
+        if not cur.fetchone():
+            pending.append(cid)
+    return pending
 
 
 def record_delivery_attempt(
@@ -1353,6 +1900,7 @@ def record_delivery_attempt(
     chat_id: str,
     success: bool,
     error: str = "",
+    page_number: int = 1,
 ) -> None:
     now_iso = datetime.now().isoformat()
     status = "sent" if success else "failed"
@@ -1361,67 +1909,80 @@ def record_delivery_attempt(
             """
             UPDATE outbox_deliveries
             SET status = ?, attempts = attempts + 1, last_attempt_at = ?, error_message = ?
-            WHERE outbox_id = ? AND chat_id = ?
+            WHERE outbox_id = ? AND page_number = ? AND chat_id = ?
             """,
-            (status, now_iso, error, outbox_id, str(chat_id)),
+            (status, now_iso, error, outbox_id, page_number, str(chat_id)),
         )
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT COUNT(*) AS pending_cnt FROM outbox_deliveries
-            WHERE outbox_id = ? AND status != 'sent'
-            """,
-            (outbox_id,),
-        )
-        row = cur.fetchone()
-        all_sent = (row["pending_cnt"] == 0) if row else False
-        out_status = "sent" if all_sent else "failed"
-        conn.execute(
-            """
-            UPDATE outbox
-            SET status = ?, attempts = attempts + 1, last_attempt_at = ?,
-                error_message = CASE WHEN ? THEN '' ELSE ? END
-            WHERE id = ?
-            """,
-            (out_status, now_iso, all_sent, error, outbox_id),
-        )
-        if all_sent:
-            cur.execute("SELECT DISTINCT event_id, revision FROM outbox_events WHERE outbox_id = ?", (outbox_id,))
-            linked = cur.fetchall()
-            if not linked:
-                cur.execute("SELECT event_id, revision FROM outbox WHERE id = ?", (outbox_id,))
-                o_row = cur.fetchone()
-                if o_row and not o_row[0].startswith("digest:") and not o_row[0].startswith("legacy:") and o_row[0] != "digest":
-                    linked = [(o_row[0], o_row[1] or 1)]
-            for mid, mrev in linked:
-                conn.execute(
-                    """
-                    INSERT INTO event_notifications (event_id, status, notified_at)
-                    VALUES (?, 'sent', ?)
-                    ON CONFLICT(event_id) DO UPDATE SET status = 'sent', notified_at = excluded.notified_at
-                    """,
-                    (mid, now_iso),
-                )
-                conn.execute("UPDATE events SET status = 'sent' WHERE id = ?", (mid,))
+        cur.execute("SELECT COUNT(*) FROM outbox_pages WHERE outbox_id = ?", (outbox_id,))
+        has_pages = (cur.fetchone()[0] > 0)
+        if not has_pages:
+            cur.execute(
+                """
+                SELECT COUNT(*) AS pending_cnt FROM outbox_deliveries
+                WHERE outbox_id = ? AND status != 'sent'
+                """,
+                (outbox_id,),
+            )
+            row = cur.fetchone()
+            all_sent = (row["pending_cnt"] == 0) if row else False
+            out_status = "sent" if all_sent else "failed"
+            conn.execute(
+                """
+                UPDATE outbox
+                SET status = ?, attempts = attempts + 1, last_attempt_at = ?,
+                    error_message = CASE WHEN ? THEN '' ELSE ? END
+                WHERE id = ?
+                """,
+                (out_status, now_iso, all_sent, error, outbox_id),
+            )
+            if all_sent:
+                cur.execute("SELECT DISTINCT event_id, revision FROM outbox_events WHERE outbox_id = ?", (outbox_id,))
+                linked = cur.fetchall()
+                if not linked:
+                    cur.execute("SELECT event_id, revision FROM outbox WHERE id = ?", (outbox_id,))
+                    o_row = cur.fetchone()
+                    if o_row and not o_row[0].startswith("digest:") and not o_row[0].startswith("legacy:") and o_row[0] != "digest":
+                        linked = [(o_row[0], o_row[1] or 1)]
+                for mid, mrev in linked:
+                    conn.execute(
+                        """
+                        INSERT INTO event_notifications (event_id, revision, status, notified_at)
+                        VALUES (?, ?, 'sent', ?)
+                        ON CONFLICT(event_id, revision) DO UPDATE SET status = 'sent', notified_at = excluded.notified_at
+                        """,
+                        (mid, mrev, now_iso),
+                    )
+                    conn.execute("UPDATE events SET status = 'sent' WHERE id = ? AND revision = ?", (mid, mrev))
 
 
 def mark_event_notified(
-    conn: sqlite3.Connection, event_id: str, status: str = "sent"
+    conn: sqlite3.Connection,
+    event_id: str,
+    status: str = "sent",
+    revision: int | None = None,
 ) -> None:
     now_iso = datetime.now().isoformat()
+    rev = revision if revision is not None else 1
     with conn:
         conn.execute(
             """
-            INSERT INTO event_notifications (event_id, status, notified_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(event_id) DO UPDATE SET status = excluded.status, notified_at = excluded.notified_at
+            INSERT INTO event_notifications (event_id, revision, status, notified_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(event_id, revision) DO UPDATE SET status = excluded.status, notified_at = excluded.notified_at
             """,
-            (event_id, status, now_iso),
+            (event_id, rev, status, now_iso),
         )
-        conn.execute(
-            "UPDATE events SET status = ? WHERE id = ?",
-            (status, event_id),
-        )
+        if revision is not None:
+            conn.execute(
+                "UPDATE events SET status = ? WHERE id = ? AND revision = ?",
+                (status, event_id, revision),
+            )
+        else:
+            conn.execute(
+                "UPDATE events SET status = ? WHERE id = ?",
+                (status, event_id),
+            )
 
 
 def get_outbox_for_event(
@@ -1470,7 +2031,7 @@ def get_recent_events_for_clustering(
         """
         SELECT e.*,
                COALESCE(
-                   (SELECT en.status FROM event_notifications en WHERE en.event_id = e.id),
+                   (SELECT en.status FROM event_notifications en WHERE en.event_id = e.id AND (en.revision = e.revision OR e.revision IS NULL) ORDER BY en.notified_at DESC LIMIT 1),
                    o.status,
                    CASE WHEN e.status IN ('sent', 'pending', 'notified') THEN e.status ELSE NULL END
                ) as outbox_status

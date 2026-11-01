@@ -90,14 +90,15 @@ def deliver(
         log.error(err)
         return False, err
 
+    p_num = page_number if page_number is not None else 1
     if conn is not None and outbox_id is not None:
         from . import store
         # Persist delivery state = 'sending' BEFORE the HTTP call (at-most-once safety)
         store.update_outbox_status(conn, outbox_id, "sending")
         if page_number is not None:
             store.mark_outbox_page_status(conn, outbox_id, page_number, "sending")
-        store.init_outbox_deliveries(conn, outbox_id, chat_ids)
-        pending_cids = store.get_pending_delivery_chat_ids(conn, outbox_id)
+        store.init_outbox_deliveries(conn, outbox_id, chat_ids, page_number=p_num)
+        pending_cids = store.get_pending_delivery_chat_ids(conn, outbox_id, page_number=p_num)
         # N4: Retry only recipients that are both pending and currently configured
         configured_set = set(chat_ids)
         pending_cids = [cid for cid in pending_cids if cid in configured_set]
@@ -113,14 +114,14 @@ def deliver(
             send_to_telegram(token, cid, text)
             if conn is not None and outbox_id is not None:
                 from . import store
-                store.record_delivery_attempt(conn, outbox_id, cid, success=True)
+                store.record_delivery_attempt(conn, outbox_id, cid, success=True, page_number=p_num)
         except Exception as e:
             err_msg = f"Chat {cid} ga yuborishda xato: {e}"
             log.error(err_msg)
             errors.append(err_msg)
             if conn is not None and outbox_id is not None:
                 from . import store
-                store.record_delivery_attempt(conn, outbox_id, cid, success=False, error=str(e))
+                store.record_delivery_attempt(conn, outbox_id, cid, success=False, error=str(e), page_number=p_num)
 
     if errors:
         return False, "; ".join(errors)

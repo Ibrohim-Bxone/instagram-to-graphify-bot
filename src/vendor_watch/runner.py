@@ -20,10 +20,17 @@ def load_sources() -> list[dict]:
 
 
 def _mark_all_done(conn: sqlite3.Connection, ev: dict) -> None:
-    rev = ev.get("revision", 1)
-    member_ids = ev.get("member_ids") or [ev["id"]]
-    for mid in member_ids:
-        store.mark_processing_job_done(conn, mid, revision=rev)
+    if "member_items" in ev and ev["member_items"]:
+        for mid, mrev in ev["member_items"]:
+            store.mark_processing_job_done(conn, mid, revision=mrev)
+    elif "member_revisions" in ev and ev["member_revisions"]:
+        for mid, mrev in ev["member_revisions"].items():
+            store.mark_processing_job_done(conn, mid, revision=mrev)
+    else:
+        rev = ev.get("revision", 1)
+        member_ids = ev.get("member_ids") or [ev["id"]]
+        for mid in member_ids:
+            store.mark_processing_job_done(conn, mid, revision=rev)
 
 
 def _mark_outbox_done(conn: sqlite3.Connection, outbox_id: int, event_id: str) -> None:
@@ -51,10 +58,22 @@ def _mark_outbox_done(conn: sqlite3.Connection, outbox_id: int, event_id: str) -
             store.mark_processing_job_done(conn, event_id, revision=1)
 
 
-def _mark_all_notified(conn: sqlite3.Connection, ev: dict, status: str = "sent") -> None:
-    member_ids = ev.get("member_ids") or [ev["id"]]
-    for mid in member_ids:
-        store.mark_event_notified(conn, mid, status)
+def _mark_all_notified(conn: sqlite3.Connection, ev: dict, status: str = "sent", revision: int | None = None) -> None:
+    if revision is not None:
+        member_ids = ev.get("member_ids") or [ev["id"]]
+        for mid in member_ids:
+            store.mark_event_notified(conn, mid, status, revision=revision)
+    elif "member_items" in ev and ev["member_items"]:
+        for mid, mrev in ev["member_items"]:
+            store.mark_event_notified(conn, mid, status, revision=mrev)
+    elif "member_revisions" in ev and ev["member_revisions"]:
+        for mid, mrev in ev["member_revisions"].items():
+            store.mark_event_notified(conn, mid, status, revision=mrev)
+    else:
+        member_ids = ev.get("member_ids") or [ev["id"]]
+        rev = ev.get("revision", 1)
+        for mid in member_ids:
+            store.mark_event_notified(conn, mid, status, revision=rev)
 
 
 def run_cycle(
@@ -295,6 +314,9 @@ def run_cycle(
         if uj.get("triage_type") == "account_change":
             u_type = "account_change"
             u_prio = uj.get("priority", "high")
+        elif uj.get("priority") == "digest" and store.get_enrichment_attempts(conn, uj["id"], uj.get("revision", 1)) >= 3:
+            u_type = uj.get("triage_type") or "digest"
+            u_prio = "digest"
         else:
             u_type, u_prio = triage.classify_event(uj)
         uj["triage_type"] = u_type
@@ -376,11 +398,31 @@ def run_cycle(
                     ev_rank = triage.SEVERITY_ORDER.get(t_type, 10)
                     p_rank = triage.SEVERITY_ORDER.get(p_type, 10)
                     if ev_rank <= p_rank:
-                        already_notified = True
-                        break
+                        # Check if ev contains any member that is a new undelivered revision
+                        # Persisted entity/rank dedupe must not silently complete NEW undelivered (event_id, revision)
+                        cur = conn.cursor()
+                        has_new_undelivered_rev = False
+                        for mid, mrev in (ev.get("member_items") or [(ev["id"], ev.get("revision", 1))]):
+                            if not store.is_event_already_sent(conn, mid, revision=mrev):
+                                if mrev > 1:
+                                    has_new_undelivered_rev = True
+                                    break
+                                cur.execute(
+                                    "SELECT 1 FROM events WHERE id = ? AND revision < ? LIMIT 1",
+                                    (mid, mrev),
+                                )
+                                if cur.fetchone():
+                                    has_new_undelivered_rev = True
+                                    break
+
+                        if not has_new_undelivered_rev:
+                            already_notified = True
+                            break
 
         if already_notified:
-            _mark_all_done(conn, ev)
+            for mid, mrev in (ev.get("member_items") or [(ev["id"], ev.get("revision", 1))]):
+                if mrev == 1 or store.is_event_already_sent(conn, mid, revision=mrev):
+                    store.mark_processing_job_done(conn, mid, revision=mrev)
             continue
 
         filtered_events.append(ev)
@@ -403,6 +445,10 @@ def run_cycle(
             _mark_all_done(conn, ev)
             continue
 
+        rev = ev.get("revision", 1)
+        enrich_attempts = store.get_enrichment_attempts(conn, ev["id"], rev)
+        is_exhausted = (enrich_attempts >= 3) or (ev.get("priority") == "digest" and enrich_attempts > 0)
+
         if t_type == "account_change":
             enrichment = {
                 "uz_title": ev.get("title", ""),
@@ -412,6 +458,21 @@ def run_cycle(
                 "possible_overlap_with_custom_tool": None,
                 "is_raw_mode": False,
             }
+        elif is_exhausted:
+            ev["priority"] = "digest"
+            prio = "digest"
+            raw_title = ev.get("title", "")
+            enrichment = {
+                "uz_title": f"[Boyitilmagan] {raw_title}" if not raw_title.startswith("[Boyitilmagan]") else raw_title,
+                "uz_summary": ev.get("summary") or ev.get("raw_content", ""),
+                "uz_benefit": "",
+                "uz_how_to_use": "",
+                "possible_overlap_with_custom_tool": None,
+                "is_raw_mode": True,
+                "unenriched": True,
+            }
+            digest_items.append((ev, enrichment))
+            continue
         else:
             enrichment = enricher.enrich_event(
                 ev,
@@ -419,7 +480,6 @@ def run_cycle(
                 use_stub=fixtures,
             )
 
-        rev = ev.get("revision", 1)
         if prio == "high":
             if enrichment.get("is_raw_mode"):
                 # An item whose enrichment failed is never sent as high priority:
@@ -438,6 +498,7 @@ def run_cycle(
                         attempts, ev["id"],
                     )
                     ev["priority"] = "digest"
+                    store.downgrade_event_to_digest(conn, ev["id"], rev)
                     enrichment["unenriched"] = True
                     raw_title = ev.get("title", "")
                     if not raw_title.startswith("[Boyitilmagan]"):
@@ -495,6 +556,7 @@ def run_cycle(
         store.update_outbox_status(conn, out_id, "sent" if success else "failed", err)
         _mark_all_notified(conn, ev, "sent" if success else "failed")
         if success:
+            _mark_outbox_done(conn, out_id, ev.get("key") or ev["id"])
             _mark_all_done(conn, ev)
 
     # 6. Process digest (daily or --digest or --fixtures or --baseline-digest)
@@ -569,11 +631,10 @@ def run_cycle(
                 _mark_outbox_done(conn, out_id, digest_key)
                 for ev in all_member_events:
                     _mark_all_notified(conn, ev, "sent")
+                if not dry_run:
+                    store.set_app_state(conn, "last_digest_date", today_str)
             else:
                 store.update_outbox_status(conn, out_id, "failed", error_message=last_err)
-
-        if not dry_run and (is_daily_due or digest_mode):
-            store.set_app_state(conn, "last_digest_date", today_str)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

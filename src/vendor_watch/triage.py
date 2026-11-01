@@ -95,6 +95,22 @@ _MODEL_RELEASE_WORDING = (
     "unveiled",
 )
 
+_TUTORIAL_KEYWORDS = (
+    "best practice",
+    "best practices",
+    "tutorial",
+    "guide to",
+    "guide for",
+    "walkthrough",
+    "how to",
+    "how-to",
+    "sample code",
+    "tips for",
+    "fine-tuning best practices",
+    "getting started with",
+)
+
+
 _PRICING_KEYWORDS = (
     "price reduction",
     "pricing update",
@@ -237,13 +253,49 @@ def classify_event(event: dict) -> tuple[str, str]:
             return "breaking", "high"
 
     # 4. New model releases -> high only when release wording refers to the named model itself
-    # SDK releases (e.g. "added support for GPT-4o") must NOT become new_model/high
+    # SDK releases (e.g. "added support for GPT-4o"), tutorials, dashboard/tool launches must NOT become new_model/high
     is_sdk = "sdk" in product or "python" in product or "cli" in product or "sdk" in source_id or "client" in product
     is_support_phrase = bool(_SUPPORT_FOR_MODEL_RE.search(full_text))
-    has_model_name = bool(_MODEL_NAME_RE.search(full_text))
-    has_release_wording = any(k in full_text for k in _MODEL_RELEASE_WORDING)
+    is_tutorial = any(k in title for k in _TUTORIAL_KEYWORDS)
 
-    if not is_sdk and not is_support_phrase and has_model_name and has_release_wording:
+    is_model_release = False
+    if not is_sdk and not is_support_phrase and not is_tutorial:
+        clauses = re.split(r"[\n\.\?!;—–]+", full_text)
+        for clause in clauses:
+            clause = clause.strip()
+            if not clause:
+                continue
+            has_model = bool(_MODEL_NAME_RE.search(clause))
+            has_wording = any(k in clause for k in _MODEL_RELEASE_WORDING)
+            if has_model and has_wording:
+                if bool(_SUPPORT_FOR_MODEL_RE.search(clause)):
+                    continue
+                if any(k in clause for k in _TUTORIAL_KEYWORDS):
+                    continue
+                if any(w in clause for w in ("dashboard", "console", "playground", "portal")) and not any(
+                    w in clause for w in ("foundation model", "frontier model", "new model", "flagship model")
+                ):
+                    continue
+                is_model_release = True
+                break
+
+        if not is_model_release:
+            title_lower = title.strip().lower()
+            if bool(_MODEL_NAME_RE.search(title_lower)) and len(title_lower.split()) <= 4:
+                if not any(k in title_lower for k in _TUTORIAL_KEYWORDS):
+                    if any(
+                        k in full_text
+                        for k in (
+                            "new model",
+                            "foundation model",
+                            "frontier model",
+                            "now generally available",
+                            "is now available",
+                        )
+                    ):
+                        is_model_release = True
+
+    if is_model_release:
         return "new_model", "high"
 
     # 5. Pricing updates -> high
@@ -340,6 +392,10 @@ def cluster_duplicates(events: list[dict]) -> list[dict]:
                 ev["links"] = [ev["link"]] if ev.get("link") else []
             if "member_ids" not in ev and ev.get("id"):
                 ev["member_ids"] = [ev["id"]]
+            if "member_items" not in ev and ev.get("id"):
+                ev["member_items"] = [(ev["id"], ev.get("revision", 1))]
+            if "member_revisions" not in ev and ev.get("id"):
+                ev["member_revisions"] = {ev["id"]: ev.get("revision", 1)}
             merged_events.append(ev)
         else:
             # Merge cluster: keep all member content and the maximum severity
@@ -379,8 +435,32 @@ def cluster_duplicates(events: list[dict]) -> list[dict]:
                     best_type = itype
                     best_prio = iprio
 
+            member_items = []
+            member_revisions = {}
+            for item in cluster:
+                if not item.get("id"):
+                    continue
+                if "member_items" in item and item["member_items"]:
+                    for mid, mrev in item["member_items"]:
+                        if mid not in member_revisions:
+                            member_items.append((mid, mrev))
+                            member_revisions[mid] = mrev
+                elif "member_revisions" in item and item["member_revisions"]:
+                    for mid, mrev in item["member_revisions"].items():
+                        if mid not in member_revisions:
+                            member_items.append((mid, mrev))
+                            member_revisions[mid] = mrev
+                else:
+                    mid = item["id"]
+                    mrev = item.get("revision", 1)
+                    if mid not in member_revisions:
+                        member_items.append((mid, mrev))
+                        member_revisions[mid] = mrev
+
             merged = dict(primary)
-            merged["member_ids"] = [item["id"] for item in cluster if item.get("id")]
+            merged["member_items"] = member_items
+            merged["member_revisions"] = member_revisions
+            merged["member_ids"] = [mid for mid, _ in member_items]
             merged["links"] = all_links
             merged["clustered_sources"] = all_products
             merged["cluster_count"] = len(cluster)
