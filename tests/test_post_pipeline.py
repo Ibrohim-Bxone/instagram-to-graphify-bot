@@ -9,6 +9,8 @@ from src import pipeline, queue_db  # noqa: E402
 
 
 def test_text_post_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setattr(queue_db.config, "QUEUE_DB", tmp_path / "jobs.sqlite3")
+    queue_db.init()
     monkeypatch.setattr(pipeline.config, "ARCHIVE_DIR", tmp_path)
     monkeypatch.setattr(pipeline.archive.config, "ARCHIVE_DIR", tmp_path)
     monkeypatch.setattr(pipeline.kb, "upsert_record", lambda rec, *a, **k: len(rec.get("items", [])) + 1)
