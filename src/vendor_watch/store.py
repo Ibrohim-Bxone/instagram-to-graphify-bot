@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 import sqlite3
 
-from .delivery_state import derive_status
+from .delivery_state import derive_status, derive_deliveries_status
 from .parser import strip_html
 
 log = logging.getLogger("vendor_watch.store")
@@ -66,18 +66,18 @@ def _derive_consistent_outbox_and_page_statuses(conn: sqlite3.Connection) -> Non
             for p_num, p_st in pages:
                 if has_page_col:
                     cur.execute(
-                        "SELECT chat_id, status FROM outbox_deliveries WHERE outbox_id = ? AND page_number = ?",
+                        "SELECT chat_id, status FROM outbox_deliveries WHERE outbox_id = ? AND page_number = ? ORDER BY rowid ASC",
                         (oid, p_num),
                     )
                 else:
                     cur.execute(
-                        "SELECT chat_id, status FROM outbox_deliveries WHERE outbox_id = ?",
+                        "SELECT chat_id, status FROM outbox_deliveries WHERE outbox_id = ? ORDER BY rowid ASC",
                         (oid,),
                     )
                 delivs = cur.fetchall()
                 if not delivs:
                     continue
-                new_p_st = derive_status([st for _, st in delivs])
+                new_p_st = derive_deliveries_status(delivs)
                 if new_p_st != p_st:
                     conn.execute(
                         "UPDATE outbox_pages SET status = ? WHERE outbox_id = ? AND page_number = ?",
@@ -90,11 +90,11 @@ def _derive_consistent_outbox_and_page_statuses(conn: sqlite3.Connection) -> Non
             if new_out_st == "failed" and cur_out_status == "failed_final":
                 new_out_st = "failed_final"
         else:
-            cur.execute("SELECT chat_id, status FROM outbox_deliveries WHERE outbox_id = ?", (oid,))
+            cur.execute("SELECT chat_id, status FROM outbox_deliveries WHERE outbox_id = ? ORDER BY rowid ASC", (oid,))
             delivs = cur.fetchall()
             if not delivs:
                 continue
-            new_out_st = derive_status([st for _, st in delivs])
+            new_out_st = derive_deliveries_status(delivs)
             if new_out_st == "failed" and cur_out_status == "failed_final":
                 new_out_st = "failed_final"
 
@@ -461,12 +461,12 @@ def _recover_sending_outbox(conn: sqlite3.Connection) -> int:
                     att = (att_r[0] if att_r else 0) or 0
                     new_st = "failed_final" if att >= 3 else "failed"
         else:
-            cur.execute("SELECT status FROM outbox_deliveries WHERE outbox_id = ?", (oid,))
-            d_statuses = [r[0] for r in cur.fetchall()]
-            if not d_statuses:
+            cur.execute("SELECT chat_id, status FROM outbox_deliveries WHERE outbox_id = ? ORDER BY rowid ASC", (oid,))
+            delivs = cur.fetchall()
+            if not delivs:
                 new_st = "ambiguous"
             else:
-                new_st = derive_status(d_statuses)
+                new_st = derive_deliveries_status(delivs)
                 if new_st == "failed":
                     cur.execute("SELECT attempts FROM outbox WHERE id = ?", (oid,))
                     att_r = cur.fetchone()
@@ -2049,13 +2049,17 @@ def record_delivery_attempt(
         cur.execute("SELECT COUNT(*) FROM outbox_pages WHERE outbox_id = ?", (outbox_id,))
         has_pages = (cur.fetchone()[0] > 0)
         if not has_pages:
-            cur.execute("SELECT status FROM outbox_deliveries WHERE outbox_id = ?", (outbox_id,))
-            d_statuses = [r[0] for r in cur.fetchall()]
-            if any(s in ("pending", "sending") for s in d_statuses):
+            cur.execute("SELECT chat_id, status FROM outbox_deliveries WHERE outbox_id = ? ORDER BY rowid ASC", (outbox_id,))
+            delivs = cur.fetchall()
+            if not delivs:
+                return
+
+            if any(st in ("pending", "sending") for _, st in delivs):
                 # Deliveries still in-flight to other recipients; preserve outbox status as 'sending'
                 return
 
-            out_status = derive_status(d_statuses)
+            out_status = derive_deliveries_status(delivs)
+
             all_sent = (out_status == "sent")
 
             cur.execute("PRAGMA table_info(outbox)")

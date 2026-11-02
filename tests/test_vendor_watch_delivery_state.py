@@ -21,7 +21,7 @@ import urllib.error
 import pytest
 
 from src.vendor_watch import delivery, runner, store
-from src.vendor_watch.delivery_state import derive_status
+from src.vendor_watch.delivery_state import derive_status, derive_recipient_status, derive_deliveries_status
 
 
 @pytest.mark.parametrize(
@@ -482,3 +482,313 @@ def test_finding_2_single_page_digest_continuation_not_blocked_by_daily_schedule
     runner.run_cycle(db_path=db_path, dry_run=False, digest_mode=False, once=True, today_date=today_str)
 
     assert sent_to == ["chat-b"], f"Expected chat-b to receive pending single-page digest, got {sent_to}"
+
+
+@pytest.mark.parametrize(
+    "rows,expected",
+    [
+        # Rule 1: sent present -> sent
+        (["sent"], "sent"),
+        (["failed", "sent"], "sent"),
+        (["sent", "failed"], "sent"),
+        (["ambiguous", "sent"], "sent"),
+        (["sent", "ambiguous"], "sent"),
+        (["pending", "sent"], "sent"),
+        (["sent", "pending"], "sent"),
+        (["failed_final", "sent"], "sent"),
+        (["failed", "ambiguous", "sent"], "sent"),
+        ([{"status": "failed"}, {"status": "sent"}], "sent"),
+        ([("chat-1", "failed"), ("chat-1", "sent")], "sent"),
+
+        # Rule 2: ambiguous present (no sent) -> ambiguous
+        (["ambiguous"], "ambiguous"),
+        (["failed", "ambiguous"], "ambiguous"),
+        (["ambiguous", "failed"], "ambiguous"),
+        (["pending", "ambiguous"], "ambiguous"),
+        (["ambiguous", "pending"], "ambiguous"),
+        (["sending", "ambiguous"], "ambiguous"),
+        (["failed_final", "ambiguous"], "ambiguous"),
+        (["failed", "failed", "ambiguous"], "ambiguous"),
+        ([{"status": "failed"}, {"status": "ambiguous"}], "ambiguous"),
+        ([("chat-1", "failed"), ("chat-1", "ambiguous")], "ambiguous"),
+
+        # Rule 3: neither sent nor ambiguous -> latest row status (time / rowid / order)
+        (["failed"], "failed"),
+        (["failed", "failed"], "failed"),
+        (["failed", "pending"], "pending"),
+        (["pending", "failed"], "failed"),
+        (["failed", "sending"], "sending"),
+        (["sending", "failed"], "failed"),
+        (["failed", "failed_final"], "failed_final"),
+        (["pending"], "pending"),
+        ([], "sent"),
+        ([("chat-1", "pending"), ("chat-1", "failed")], "failed"),
+        ([("chat-1", "failed"), ("chat-1", "pending")], "pending"),
+    ],
+)
+def test_d1_derive_recipient_status_table(rows, expected):
+    """D1 table test: verifying single-pair effective status precedence."""
+    assert derive_recipient_status(rows) == expected
+
+
+def test_d3_codex_scenario_failed_and_sent_no_failed_final(tmp_path: Path, monkeypatch):
+    """Codex scenario: A pair with legacy 'failed' + current 'sent' rows.
+    Must resolve page to 'sent', make 0 HTTP calls over next 3 cycles,
+    leave attempts unchanged, and never transition to 'failed_final'.
+    """
+    db_path = tmp_path / "codex.db"
+    conn = store.get_connection(db_path)
+    today_str = "2026-11-02"
+    store.set_app_state(conn, "last_digest_date", today_str)
+    out_id = store.add_to_outbox(conn, "ev-codex", "high", "High alert text")
+
+    # Multipage digest page 1
+    conn.execute(
+        "INSERT INTO outbox_pages (outbox_id, page_number, rendered_text, status) VALUES (?, 1, 'Page 1 text', 'pending')",
+        (out_id,),
+    )
+    conn.execute(
+        "INSERT INTO outbox_deliveries (outbox_id, page_number, chat_id, status, attempts, error_message) "
+        "VALUES (?, 1, 'chat-1', 'failed', 1, 'HTTP 502 Bad Gateway')",
+        (out_id,),
+    )
+    conn.execute(
+        "INSERT INTO outbox_deliveries (outbox_id, page_number, chat_id, status, attempts, error_message) "
+        "VALUES (?, 1, 'chat-1', 'sent', 1, '')",
+        (out_id,),
+    )
+    conn.commit()
+
+    # Recalculate startup statuses
+    store._derive_consistent_outbox_and_page_statuses(conn)
+    cur = conn.cursor()
+    cur.execute("SELECT status FROM outbox_pages WHERE outbox_id = ? AND page_number = 1", (out_id,))
+    p_st = cur.fetchone()[0]
+    assert p_st == "sent", f"Page status must be 'sent', got {p_st}"
+
+    cur.execute("SELECT status, attempts FROM outbox WHERE id = ?", (out_id,))
+    out_st, att_init = cur.fetchone()
+    assert out_st == "sent", f"Outbox status must be 'sent', got {out_st}"
+    conn.commit()
+    conn.close()
+
+    # Now run runner across 3 cycles
+    monkeypatch.setenv("BOT_TOKEN", "mock-token")
+    monkeypatch.setattr(delivery, "get_target_chat_ids", lambda: ["chat-1"])
+    monkeypatch.setattr(runner, "load_sources", lambda: [])
+    http_calls = []
+    monkeypatch.setattr(delivery, "send_to_telegram", lambda token, cid, txt, timeout=15: http_calls.append(cid))
+
+    for cycle in range(1, 4):
+        runner.run_cycle(db_path=db_path, dry_run=False, once=True, today_date=today_str)
+
+    assert http_calls == [], f"Expected 0 HTTP calls, got {http_calls}"
+
+    conn2 = store.get_connection(db_path)
+    cur = conn2.cursor()
+    cur.execute("SELECT status, attempts FROM outbox WHERE id = ?", (out_id,))
+    final_st, final_att = cur.fetchone()
+    assert final_att == att_init, f"Attempts must not increment, got {final_att} vs {att_init}"
+    assert final_st == "sent", f"Outbox must remain 'sent', never 'failed_final', got {final_st}"
+    conn2.close()
+
+
+def test_d3_codex_scenario_single_page_failed_and_sent_no_failed_final(tmp_path: Path, monkeypatch):
+    """Codex scenario on single-page outbox (no outbox_pages table rows).
+    Legacy 'failed' + current 'sent' must resolve outbox to 'sent', 0 HTTP calls, no failed_final.
+    """
+    db_path = tmp_path / "codex_single.db"
+    conn = store.get_connection(db_path)
+    today_str = "2026-11-02"
+    store.set_app_state(conn, "last_digest_date", today_str)
+    out_id = store.add_to_outbox(conn, "ev-codex-single", "high", "Single alert text")
+
+    conn.execute(
+        "INSERT INTO outbox_deliveries (outbox_id, page_number, chat_id, status, attempts, error_message) "
+        "VALUES (?, 1, 'chat-1', 'failed', 1, 'HTTP 502 Bad Gateway')",
+        (out_id,),
+    )
+    conn.execute(
+        "INSERT INTO outbox_deliveries (outbox_id, page_number, chat_id, status, attempts, error_message) "
+        "VALUES (?, 1, 'chat-1', 'sent', 1, '')",
+        (out_id,),
+    )
+    conn.commit()
+
+    store._derive_consistent_outbox_and_page_statuses(conn)
+    cur = conn.cursor()
+    cur.execute("SELECT status, attempts FROM outbox WHERE id = ?", (out_id,))
+    out_st, att_init = cur.fetchone()
+    assert out_st == "sent", f"Outbox status must be 'sent', got {out_st}"
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("BOT_TOKEN", "mock-token")
+    monkeypatch.setattr(delivery, "get_target_chat_ids", lambda: ["chat-1"])
+    monkeypatch.setattr(runner, "load_sources", lambda: [])
+    http_calls = []
+    monkeypatch.setattr(delivery, "send_to_telegram", lambda token, cid, txt, timeout=15: http_calls.append(cid))
+
+    for cycle in range(1, 4):
+        runner.run_cycle(db_path=db_path, dry_run=False, once=True, today_date=today_str)
+
+    assert http_calls == [], f"Expected 0 HTTP calls, got {http_calls}"
+
+    conn2 = store.get_connection(db_path)
+    cur = conn2.cursor()
+    cur.execute("SELECT status, attempts FROM outbox WHERE id = ?", (out_id,))
+    final_st, final_att = cur.fetchone()
+    assert final_att == att_init, f"Attempts must not increment, got {final_att} vs {att_init}"
+    assert final_st == "sent", f"Outbox must remain 'sent', never 'failed_final', got {final_st}"
+    conn2.close()
+
+
+def test_d3_failed_and_ambiguous_remains_ambiguous_no_resend(tmp_path: Path, monkeypatch):
+    """Scenario: A pair with legacy 'failed' + current 'ambiguous' rows.
+    Must resolve to 'ambiguous', and must NOT be resent in subsequent cycle.
+    """
+    db_path = tmp_path / "failed_ambig.db"
+    conn = store.get_connection(db_path)
+    today_str = "2026-11-02"
+    store.set_app_state(conn, "last_digest_date", today_str)
+    out_id = store.add_to_outbox(conn, "ev-ambig", "high", "High alert text")
+    conn.execute(
+        "INSERT INTO outbox_pages (outbox_id, page_number, rendered_text, status) VALUES (?, 1, 'Page 1 text', 'pending')",
+        (out_id,),
+    )
+
+    conn.execute(
+        "INSERT INTO outbox_deliveries (outbox_id, page_number, chat_id, status, attempts, error_message) "
+        "VALUES (?, 1, 'chat-1', 'failed', 1, 'HTTP 502 Bad Gateway')",
+        (out_id,),
+    )
+    conn.execute(
+        "INSERT INTO outbox_deliveries (outbox_id, page_number, chat_id, status, attempts, error_message) "
+        "VALUES (?, 1, 'chat-1', 'ambiguous', 1, 'Connection reset by peer')",
+        (out_id,),
+    )
+    conn.commit()
+
+    store._derive_consistent_outbox_and_page_statuses(conn)
+    cur = conn.cursor()
+    cur.execute("SELECT status FROM outbox_pages WHERE outbox_id = ? AND page_number = 1", (out_id,))
+    p_st = cur.fetchone()[0]
+    assert p_st == "ambiguous", f"Page status must be 'ambiguous', got {p_st}"
+
+    cur.execute("SELECT status FROM outbox WHERE id = ?", (out_id,))
+    out_st = cur.fetchone()[0]
+    assert out_st == "ambiguous", f"Outbox status must be 'ambiguous', got {out_st}"
+    conn.commit()
+    conn.close()
+
+    # Next cycle should NOT resend chat-1
+    monkeypatch.setenv("BOT_TOKEN", "mock-token")
+    monkeypatch.setattr(delivery, "get_target_chat_ids", lambda: ["chat-1"])
+    monkeypatch.setattr(runner, "load_sources", lambda: [])
+    http_calls = []
+    monkeypatch.setattr(delivery, "send_to_telegram", lambda token, cid, txt, timeout=15: http_calls.append(cid))
+
+    runner.run_cycle(db_path=db_path, dry_run=False, once=True, today_date=today_str)
+    assert http_calls == [], f"Expected 0 HTTP calls (ambiguous must not be resent), got {http_calls}"
+
+
+def test_d3_only_failed_failed_remains_failed(tmp_path: Path):
+    """Scenario: A pair with only 'failed', 'failed' rows must resolve to 'failed'."""
+    db_path = tmp_path / "failed_failed.db"
+    conn = store.get_connection(db_path)
+    out_id = store.add_to_outbox(conn, "ev-ff", "high", "High alert text")
+    conn.execute(
+        "INSERT INTO outbox_pages (outbox_id, page_number, rendered_text, status) VALUES (?, 1, 'Page 1 text', 'pending')",
+        (out_id,),
+    )
+
+    conn.execute(
+        "INSERT INTO outbox_deliveries (outbox_id, page_number, chat_id, status, attempts, error_message) "
+        "VALUES (?, 1, 'chat-1', 'failed', 1, 'HTTP 500 Internal Server Error')",
+        (out_id,),
+    )
+    conn.execute(
+        "INSERT INTO outbox_deliveries (outbox_id, page_number, chat_id, status, attempts, error_message) "
+        "VALUES (?, 1, 'chat-1', 'failed', 2, 'HTTP 502 Bad Gateway')",
+        (out_id,),
+    )
+    conn.commit()
+
+    store._derive_consistent_outbox_and_page_statuses(conn)
+    cur = conn.cursor()
+    cur.execute("SELECT status FROM outbox_pages WHERE outbox_id = ? AND page_number = 1", (out_id,))
+    p_st = cur.fetchone()[0]
+    assert p_st == "failed", f"Page status must be 'failed', got {p_st}"
+
+    cur.execute("SELECT status FROM outbox WHERE id = ?", (out_id,))
+    out_st = cur.fetchone()[0]
+    assert out_st == "failed", f"Outbox status must be 'failed', got {out_st}"
+    conn.close()
+
+
+def test_record_delivery_attempt_in_flight_preserves_sending_when_one_recipient_failed(tmp_path: Path):
+    """record_delivery_attempt must not prematurely fail outbox while other recipients are pending."""
+    db_path = tmp_path / "in_flight.db"
+    conn = store.get_connection(db_path)
+    out_id = store.add_to_outbox(conn, "ev-inflight", "high", "Alert for 2 recipients")
+
+    conn.execute(
+        "INSERT INTO outbox_deliveries (outbox_id, page_number, chat_id, status) VALUES (?, 1, 'chat-1', 'pending')",
+        (out_id,),
+    )
+    conn.execute(
+        "INSERT INTO outbox_deliveries (outbox_id, page_number, chat_id, status) VALUES (?, 1, 'chat-2', 'pending')",
+        (out_id,),
+    )
+    conn.commit()
+
+    # chat-1 fails, chat-2 is still pending
+    store.record_delivery_attempt(conn, out_id, "chat-1", False, "502 Bad Gateway", 1)
+
+    cur = conn.cursor()
+    cur.execute("SELECT status, attempts FROM outbox WHERE id = ?", (out_id,))
+    out_st, att = cur.fetchone()
+    assert out_st == "pending", f"Outbox must remain in-flight (pending), got {out_st}"
+    assert att == 0, f"Outbox attempts must not increment prematurely, got {att}"
+
+    # Now chat-2 succeeds
+    store.record_delivery_attempt(conn, out_id, "chat-2", True, "", 1)
+    cur.execute("SELECT status FROM outbox WHERE id = ?", (out_id,))
+    final_st = cur.fetchone()[0]
+    assert final_st == "failed", f"Final outbox status must be 'failed' once all recipients are done, got {final_st}"
+    conn.close()
+
+
+def test_derive_recipient_status_sqlite_row_with_null_fields():
+    """derive_recipient_status must handle sqlite3.Row with NULL id or last_attempt_at gracefully."""
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE d (chat_id TEXT, status TEXT, last_attempt_at TEXT, id INTEGER)")
+    cur.execute("INSERT INTO d VALUES (?, ?, ?, ?)", ("chat-1", "failed", None, None))
+    cur.execute("INSERT INTO d VALUES (?, ?, ?, ?)", ("chat-1", "pending", "2026-11-02T10:00:00", 2))
+    cur.execute("SELECT * FROM d ORDER BY rowid ASC")
+    rows = cur.fetchall()
+
+    # Latest row by order should be 'pending', and row with NULL must not raise TypeError
+    effective = derive_recipient_status(rows)
+    assert effective == "pending", f"Expected 'pending' as latest status, got {effective}"
+    conn.close()
+
+
+def test_derive_deliveries_status_no_chat_id_dicts_extracts_status():
+    """derive_deliveries_status with dicts without chat_id must extract status, not return 'sent'."""
+    assert derive_deliveries_status([{"status": "failed"}]) == "failed"
+    assert derive_deliveries_status([{"status": "pending"}]) == "pending"
+
+
+def test_derive_recipient_status_error_message_with_hyphen_not_treated_as_timestamp():
+    """Error message strings containing '-' or 'T' must not misorder delivery rows."""
+    rows = [
+        ("c", "failed", "HTTP 502 - Bad Gateway", ""),
+        ("c", "pending", "", "2026-11-02T10:00:00"),
+    ]
+    assert derive_recipient_status(rows) == "pending"
+

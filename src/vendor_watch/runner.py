@@ -9,7 +9,7 @@ import re
 import sqlite3
 
 from . import delivery, enricher, fetcher, parser, probes, renderer, store, triage
-from .delivery_state import derive_status
+from .delivery_state import derive_status, derive_deliveries_status
 
 log = logging.getLogger("vendor_watch")
 
@@ -291,9 +291,9 @@ def run_cycle(
                                 outbox_id=out_item["id"],
                             )
                         cur = conn.cursor()
-                        cur.execute("SELECT status FROM outbox_deliveries WHERE outbox_id = ? AND page_number = ?", (out_item["id"], p_num))
-                        d_statuses = [r[0] for r in cur.fetchall()]
-                        page_st = derive_status(d_statuses) if d_statuses else ("sent" if p_success else "failed")
+                        cur.execute("SELECT chat_id, status FROM outbox_deliveries WHERE outbox_id = ? AND page_number = ? ORDER BY rowid ASC", (out_item["id"], p_num))
+                        delivs = cur.fetchall()
+                        page_st = derive_deliveries_status(delivs) if delivs else ("sent" if p_success else "failed")
                         if page_st == "sent":
                             store.mark_outbox_page_sent(conn, out_item["id"], p_num)
                             if is_digest:
@@ -797,9 +797,9 @@ def run_cycle(
                             outbox_id=out_id,
                         )
                     cur = conn.cursor()
-                    cur.execute("SELECT status FROM outbox_deliveries WHERE outbox_id = ? AND page_number = ?", (out_id, p_num))
-                    d_statuses = [r[0] for r in cur.fetchall()]
-                    page_st = derive_status(d_statuses) if d_statuses else ("sent" if p_success else "failed")
+                    cur.execute("SELECT chat_id, status FROM outbox_deliveries WHERE outbox_id = ? AND page_number = ? ORDER BY rowid ASC", (out_id, p_num))
+                    delivs = cur.fetchall()
+                    page_st = derive_deliveries_status(delivs) if delivs else ("sent" if p_success else "failed")
                     if page_st == "sent":
                         store.mark_outbox_page_sent(conn, out_id, p_num)
                         digest_page_sent_today = True
