@@ -3,9 +3,9 @@
 Two backends, chosen automatically:
   - Standalone (default): a bundled ChromaDB at data/kb_db, Chroma's own default
     embedder. Works with zero extra setup.
-  - Graphify-linked (opt-in, GRAPHIFY_DIR set in .env): writes into an existing
-    Graphify installation's kg_db instead, reusing its embedder factory so a
-    single collection is never mixed across two different embedding models.
+  - Graphify-linked (opt-in, GRAPHIFY_DIR set in .env): delegates collection access
+    to Graphify's db.get_collection() / db.reopen() so GRAPHIFY_DB_PATH and model
+    identity are respected.
 
 Ids are deterministic (`ig:<shortcode>:...`) and writes are upserts, so sending
 the same reel twice updates one entry instead of creating a second copy, and the
@@ -36,43 +36,44 @@ def _collection():
     if _col is not None:
         return _col
 
-    embed_fn = None
     if _using_graphify():
-        db_path = config.GRAPHIFY_DIR / "kg_db"
-        # Reuse Graphify's own embedder factory: one collection cannot mix
-        # embedding models, so the bot must embed exactly the way it does.
-        sys.path.insert(0, str(config.GRAPHIFY_DIR))
+        if not (config.GRAPHIFY_DIR / "db.py").is_file():
+            raise RuntimeError(
+                f"Graphify bazasini ochishda xatolik (db.py topilmadi: {config.GRAPHIFY_DIR}). "
+                f"GRAPHIFY_DIR ko'rsatilgan bo'lsa bot AYNAN Graphify orqali ochishi shart — "
+                f"aks holda vektorlar bir bazada aralashadi yoki ma'lumot bo'linadi. Bot to'xtatildi."
+            )
+        if str(config.GRAPHIFY_DIR) not in sys.path:
+            sys.path.insert(0, str(config.GRAPHIFY_DIR))
         try:
-            from embedders import build_chroma_embedding_function
-            embed_fn = build_chroma_embedding_function()
+            import db
+            _col = db.get_collection()
         except Exception as e:
             # Never fall back silently here: Graphify would keep embedding with
             # its configured model while we wrote Chroma's default vectors into
             # the same collection, corrupting the vector space with no error.
             raise RuntimeError(
-                f"Graphify embedder ishga tushmadi ({e}). GRAPHIFY_DIR ko'rsatilgan "
-                f"bo'lsa bot AYNAN o'sha embedder bilan yozishi shart — aks holda "
-                f"vektorlar bir bazada aralashadi. Bot to'xtatildi."
+                f"Graphify bazasini ochishda xatolik ({e}). GRAPHIFY_DIR ko'rsatilgan "
+                f"bo'lsa bot AYNAN Graphify orqali ochishi shart — aks holda "
+                f"vektorlar bir bazada aralashadi yoki ma'lumot bo'linadi. Bot to'xtatildi."
             ) from e
         if not _logged_backend:
+            db_path = getattr(db, "DB_PATH", config.GRAPHIFY_DIR)
             log.info("kb backend: Graphify-linked (%s)", db_path)
-    else:
-        db_path = config.STANDALONE_KB_DIR
-        if not _logged_backend:
-            log.info("kb backend: standalone (%s) — set GRAPHIFY_DIR in .env to "
-                     "link an existing Graphify installation instead", db_path)
-    _logged_backend = True
+            _logged_backend = True
+        return _col
+
+    db_path = config.STANDALONE_KB_DIR
+    if not _logged_backend:
+        log.info("kb backend: standalone (%s) — set GRAPHIFY_DIR in .env to "
+                 "link an existing Graphify installation instead", db_path)
+        _logged_backend = True
 
     client = chromadb.PersistentClient(path=str(db_path))
     kwargs = {"metadata": {"hnsw:space": "cosine"}}
-    if embed_fn is not None:
-        kwargs["embedding_function"] = embed_fn
     try:
         _col = client.get_or_create_collection(COLLECTION, **kwargs)
     except ValueError:
-        if _using_graphify() and embed_fn is not None:
-            # Same reason as above: dropping embed_fn here would mix models.
-            raise
         _col = client.get_or_create_collection(COLLECTION, metadata={"hnsw:space": "cosine"})
     return _col
 
@@ -90,9 +91,29 @@ def _est_tokens(text: str) -> int:
 
 
 def _reopen():
-    """Kolleksiya keshini bekor qilib, mavjud _collection() orqali qayta ochadi."""
+    """Kolleksiya keshini bekor qilib, qayta ochadi."""
     global _col
     _col = None
+    if _using_graphify():
+        if not (config.GRAPHIFY_DIR / "db.py").is_file():
+            raise RuntimeError(
+                f"Graphify bazasini qayta ochishda xatolik (db.py topilmadi: {config.GRAPHIFY_DIR}). "
+                f"GRAPHIFY_DIR ko'rsatilgan bo'lsa bot AYNAN Graphify orqali ochishi shart — "
+                f"aks holda vektorlar bir bazada aralashadi yoki ma'lumot bo'linadi. Bot to'xtatildi."
+            )
+        if str(config.GRAPHIFY_DIR) not in sys.path:
+            sys.path.insert(0, str(config.GRAPHIFY_DIR))
+        try:
+            import db
+            res = db.reopen()
+            _col = res if res is not None else db.get_collection()
+            return _col
+        except Exception as e:
+            raise RuntimeError(
+                f"Graphify bazasini qayta ochishda xatolik ({e}). GRAPHIFY_DIR ko'rsatilgan "
+                f"bo'lsa bot AYNAN Graphify orqali ochishi shart — aks holda "
+                f"vektorlar bir bazada aralashadi yoki ma'lumot bo'linadi. Bot to'xtatildi."
+            ) from e
     return _collection()
 
 
