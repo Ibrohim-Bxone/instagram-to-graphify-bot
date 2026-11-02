@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 import sqlite3
 
+from .delivery_state import derive_status
 from .parser import strip_html
 
 log = logging.getLogger("vendor_watch.store")
@@ -76,31 +77,7 @@ def _derive_consistent_outbox_and_page_statuses(conn: sqlite3.Connection) -> Non
                 delivs = cur.fetchall()
                 if not delivs:
                     continue
-                chat_map: dict[str, set[str]] = {}
-                for cid, st in delivs:
-                    chat_map.setdefault(cid, set()).add(st)
-                eff_set = set()
-                for cid, st_set in chat_map.items():
-                    if "sent" in st_set:
-                        eff_set.add("sent")
-                    elif "ambiguous" in st_set:
-                        eff_set.add("ambiguous")
-                    elif "failed" in st_set:
-                        eff_set.add("failed")
-                    else:
-                        eff_set.add("pending")
-
-                if p_st in ("ambiguous", "sending"):
-                    new_p_st = "ambiguous"
-                elif "ambiguous" in eff_set:
-                    new_p_st = "ambiguous"
-                elif "failed" in eff_set:
-                    new_p_st = "failed"
-                elif "pending" in eff_set:
-                    new_p_st = "pending"
-                else:
-                    new_p_st = "sent"
-
+                new_p_st = derive_status([st for _, st in delivs])
                 if new_p_st != p_st:
                     conn.execute(
                         "UPDATE outbox_pages SET status = ? WHERE outbox_id = ? AND page_number = ?",
@@ -108,50 +85,18 @@ def _derive_consistent_outbox_and_page_statuses(conn: sqlite3.Connection) -> Non
                     )
 
             cur.execute("SELECT status FROM outbox_pages WHERE outbox_id = ?", (oid,))
-            p_statuses = {r[0] for r in cur.fetchall()}
-            if cur_out_status == "failed_final":
+            p_statuses = [r[0] for r in cur.fetchall()]
+            new_out_st = derive_status(p_statuses)
+            if new_out_st == "failed" and cur_out_status == "failed_final":
                 new_out_st = "failed_final"
-            elif "failed" in p_statuses:
-                new_out_st = "failed"
-            elif "pending" in p_statuses:
-                new_out_st = "pending"
-            elif cur_out_status in ("ambiguous", "sending"):
-                new_out_st = "ambiguous"
-            elif "ambiguous" in p_statuses:
-                new_out_st = "ambiguous"
-            else:
-                new_out_st = "sent"
         else:
             cur.execute("SELECT chat_id, status FROM outbox_deliveries WHERE outbox_id = ?", (oid,))
             delivs = cur.fetchall()
             if not delivs:
                 continue
-            chat_map = {}
-            for cid, st in delivs:
-                chat_map.setdefault(cid, set()).add(st)
-            eff_set = set()
-            for cid, st_set in chat_map.items():
-                if "sent" in st_set:
-                    eff_set.add("sent")
-                elif "ambiguous" in st_set:
-                    eff_set.add("ambiguous")
-                elif "failed" in st_set:
-                    eff_set.add("failed")
-                else:
-                    eff_set.add("pending")
-
-            if cur_out_status == "failed_final":
+            new_out_st = derive_status([st for _, st in delivs])
+            if new_out_st == "failed" and cur_out_status == "failed_final":
                 new_out_st = "failed_final"
-            elif "failed" in eff_set:
-                new_out_st = "failed"
-            elif "pending" in eff_set:
-                new_out_st = "pending"
-            elif cur_out_status in ("ambiguous", "sending"):
-                new_out_st = "ambiguous"
-            elif "ambiguous" in eff_set:
-                new_out_st = "ambiguous"
-            else:
-                new_out_st = "sent"
 
         if new_out_st != cur_out_status:
             conn.execute("UPDATE outbox SET status = ? WHERE id = ?", (new_out_st, oid))
@@ -505,34 +450,28 @@ def _recover_sending_outbox(conn: sqlite3.Connection) -> int:
 
         if has_pages:
             cur.execute("SELECT status FROM outbox_pages WHERE outbox_id = ?", (oid,))
-            p_statuses = {r[0] for r in cur.fetchall()}
-            if "pending" in p_statuses:
-                new_st = "pending"
-            elif "failed" in p_statuses:
-                cur.execute("SELECT attempts FROM outbox WHERE id = ?", (oid,))
-                att_r = cur.fetchone()
-                att = (att_r[0] if att_r else 0) or 0
-                new_st = "failed_final" if att >= 3 else "failed"
-            elif p_statuses and all(s == "sent" for s in p_statuses):
-                new_st = "sent"
-            else:
+            p_statuses = [r[0] for r in cur.fetchall()]
+            if not p_statuses:
                 new_st = "ambiguous"
+            else:
+                new_st = derive_status(p_statuses)
+                if new_st == "failed":
+                    cur.execute("SELECT attempts FROM outbox WHERE id = ?", (oid,))
+                    att_r = cur.fetchone()
+                    att = (att_r[0] if att_r else 0) or 0
+                    new_st = "failed_final" if att >= 3 else "failed"
         else:
             cur.execute("SELECT status FROM outbox_deliveries WHERE outbox_id = ?", (oid,))
             d_statuses = [r[0] for r in cur.fetchall()]
             if not d_statuses:
                 new_st = "ambiguous"
-            elif any(s == "pending" for s in d_statuses):
-                new_st = "pending"
-            elif any(s == "failed" for s in d_statuses):
-                cur.execute("SELECT attempts FROM outbox WHERE id = ?", (oid,))
-                att_r = cur.fetchone()
-                att = (att_r[0] if att_r else 0) or 0
-                new_st = "failed_final" if att >= 3 else "failed"
-            elif all(s == "sent" for s in d_statuses):
-                new_st = "sent"
             else:
-                new_st = "ambiguous"
+                new_st = derive_status(d_statuses)
+                if new_st == "failed":
+                    cur.execute("SELECT attempts FROM outbox WHERE id = ?", (oid,))
+                    att_r = cur.fetchone()
+                    att = (att_r[0] if att_r else 0) or 0
+                    new_st = "failed_final" if att >= 3 else "failed"
         conn.execute("UPDATE outbox SET status = ? WHERE id = ?", (new_st, oid))
 
     return len(sending_ids)
@@ -1602,7 +1541,8 @@ def update_outbox_status(
             return
 
         # Definite failure cap at 3 attempts -> failed_final
-        if status == "failed":
+        is_definite_failure = (status == "failed")
+        if is_definite_failure:
             cur.execute("SELECT attempts FROM outbox WHERE id = ?", (outbox_id,))
             att_row = cur.fetchone()
             cur_att = (att_row[0] or 0) if att_row else 0
@@ -1618,31 +1558,36 @@ def update_outbox_status(
             conn.execute(
                 """
                 UPDATE outbox
-                SET status = ?, attempts = attempts + 1, last_attempt_at = ?,
+                SET status = ?,
+                    attempts = CASE WHEN ? THEN attempts + 1 ELSE attempts END,
+                    last_attempt_at = ?,
                     sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END,
                     next_attempt_at = CASE WHEN ? = 'failed' THEN ? ELSE '' END,
                     error_message = ?
                 WHERE id = ?
                 """,
-                (status, now_iso, status, now_iso, status, next_at_val, error_message, outbox_id),
+                (status, is_definite_failure, now_iso, status, now_iso, status, next_at_val, error_message, outbox_id),
             )
         elif has_last:
             conn.execute(
                 """
                 UPDATE outbox
-                SET status = ?, attempts = attempts + 1, last_attempt_at = ?, error_message = ?
+                SET status = ?,
+                    attempts = CASE WHEN ? THEN attempts + 1 ELSE attempts END,
+                    last_attempt_at = ?, error_message = ?
                 WHERE id = ?
                 """,
-                (status, now_iso, error_message, outbox_id),
+                (status, is_definite_failure, now_iso, error_message, outbox_id),
             )
         else:
             conn.execute(
                 """
                 UPDATE outbox
-                SET status = ?, attempts = attempts + 1
+                SET status = ?,
+                    attempts = CASE WHEN ? THEN attempts + 1 ELSE attempts END
                 WHERE id = ?
                 """,
-                (status, outbox_id),
+                (status, is_definite_failure, outbox_id),
             )
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM outbox_pages WHERE outbox_id = ?", (outbox_id,))
@@ -2069,6 +2014,7 @@ def record_delivery_attempt(
     now_iso = datetime.now().isoformat()
     if status is None:
         status = "sent" if success else "failed"
+    is_failed = (status == "failed")
     with conn:
         cur = conn.cursor()
         cur.execute("PRAGMA table_info(outbox_deliveries)")
@@ -2079,21 +2025,25 @@ def record_delivery_attempt(
             conn.execute(
                 """
                 UPDATE outbox_deliveries
-                SET status = ?, attempts = attempts + 1, last_attempt_at = ?,
+                SET status = ?,
+                    attempts = CASE WHEN ? THEN attempts + 1 ELSE attempts END,
+                    last_attempt_at = ?,
                     sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END,
                     error_message = ?
                 WHERE outbox_id = ? AND page_number = ? AND chat_id = ?
                 """,
-                (status, now_iso, status, now_iso, error, outbox_id, page_number, str(chat_id)),
+                (status, is_failed, now_iso, status, now_iso, error, outbox_id, page_number, str(chat_id)),
             )
         else:
             conn.execute(
                 """
                 UPDATE outbox_deliveries
-                SET status = ?, attempts = attempts + 1, last_attempt_at = ?, error_message = ?
+                SET status = ?,
+                    attempts = CASE WHEN ? THEN attempts + 1 ELSE attempts END,
+                    last_attempt_at = ?, error_message = ?
                 WHERE outbox_id = ? AND page_number = ? AND chat_id = ?
                 """,
-                (status, now_iso, error, outbox_id, page_number, str(chat_id)),
+                (status, is_failed, now_iso, error, outbox_id, page_number, str(chat_id)),
             )
 
         cur.execute("SELECT COUNT(*) FROM outbox_pages WHERE outbox_id = ?", (outbox_id,))
@@ -2105,22 +2055,19 @@ def record_delivery_attempt(
                 # Deliveries still in-flight to other recipients; preserve outbox status as 'sending'
                 return
 
-            all_sent = bool(d_statuses and all(s == "sent" for s in d_statuses))
-            has_ambiguous = any(s == "ambiguous" for s in d_statuses)
+            out_status = derive_status(d_statuses)
+            all_sent = (out_status == "sent")
 
             cur.execute("PRAGMA table_info(outbox)")
             o_cols = {r[1] for r in cur.fetchall()}
             has_o_sent_at = "sent_at" in o_cols
 
-            if all_sent:
-                out_status = "sent"
-            elif has_ambiguous:
-                out_status = "ambiguous"
-            else:
+            if out_status == "failed":
                 cur.execute("SELECT attempts FROM outbox WHERE id = ?", (outbox_id,))
                 att_row = cur.fetchone()
                 cur_att = att_row[0] if att_row else 0
-                out_status = "failed_final" if cur_att + 1 >= 3 else "failed"
+                if cur_att + 1 >= 3:
+                    out_status = "failed_final"
 
             if has_o_sent_at:
                 conn.execute(

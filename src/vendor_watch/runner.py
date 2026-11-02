@@ -5,9 +5,11 @@ from datetime import datetime, timedelta
 import json
 import logging
 from pathlib import Path
+import re
 import sqlite3
 
 from . import delivery, enricher, fetcher, parser, probes, renderer, store, triage
+from .delivery_state import derive_status
 
 log = logging.getLogger("vendor_watch")
 
@@ -148,43 +150,15 @@ def _mark_all_notified(conn: sqlite3.Connection, ev: dict, status: str = "sent",
 def resolve_multipage_outbox_status(
     conn: sqlite3.Connection, outbox_id: int, last_err: str = ""
 ) -> str:
-    """Resolve aggregate outbox status from outbox_pages (H3, H4).
-
-    Precedence order:
-    1. 'failed' page exists -> 'failed' (counts as attempt, next_attempt_at = now + 15 min * attempt,
-       transitions to 'failed_final' after 3 attempts).
-    2. 'pending' page exists -> 'pending' (preserves unattempted pages for retry;
-       ambiguous/sent pages are skipped during retry).
-    3. 'ambiguous' page exists -> 'ambiguous'.
-    4. Otherwise -> 'sent'.
-    """
+    """Resolve aggregate outbox status from outbox_pages (H3, H4) using derive_status."""
     cur = conn.cursor()
-    cur.execute("SELECT status FROM outbox_pages WHERE outbox_id = ?", (outbox_id,))
-    p_statuses = {r[0] for r in cur.fetchall()}
-
-    if "failed" in p_statuses:
-        cur.execute("SELECT attempts FROM outbox WHERE id = ?", (outbox_id,))
-        att_row = cur.fetchone()
-        cur_att = (att_row[0] or 0) if att_row else 0
-        new_att = cur_att + 1
-        next_attempt_at = (datetime.now() + timedelta(minutes=15 * new_att)).isoformat()
-        store.update_outbox_status(
-            conn,
-            outbox_id,
-            "failed",
-            error_message=last_err,
-            next_attempt_at=next_attempt_at,
-        )
-        return "failed_final" if new_att >= 3 else "failed"
-    elif "pending" in p_statuses:
-        store.update_outbox_status(conn, outbox_id, "pending", error_message=last_err)
-        return "pending"
-    elif "ambiguous" in p_statuses:
-        store.update_outbox_status(conn, outbox_id, "ambiguous", error_message=last_err)
-        return "ambiguous"
-    else:
-        store.update_outbox_status(conn, outbox_id, "sent")
-        return "sent"
+    cur.execute("SELECT status FROM outbox_pages WHERE outbox_id = ? ORDER BY page_number", (outbox_id,))
+    p_statuses = [r[0] for r in cur.fetchall()]
+    agg_status = derive_status(p_statuses)
+    store.update_outbox_status(conn, outbox_id, agg_status, error_message=last_err)
+    cur.execute("SELECT status FROM outbox WHERE id = ?", (outbox_id,))
+    row = cur.fetchone()
+    return row[0] if row else agg_status
 
 
 def run_cycle(
@@ -266,7 +240,33 @@ def run_cycle(
                     continue
 
             is_digest = (out_item["priority"] == "digest")
-            should_send = (out_item["priority"] == "high") or digest_mode or (is_digest and is_daily_due)
+            if out_item["priority"] == "high":
+                should_send = True
+            else:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM outbox_pages WHERE outbox_id = ?", (out_item["id"],))
+                has_pages = (cur.fetchone()[0] > 0)
+                if has_pages:
+                    should_send = True
+                elif digest_mode or is_daily_due:
+                    should_send = True
+                else:
+                    # Single-page existing digest retry/continuation is exempt from daily schedule (T4)
+                    if (out_item.get("attempts") or 0) > 0 or out_item.get("last_attempt_at") or out_item.get("status") in ("failed", "ambiguous"):
+                        should_send = True
+                    else:
+                        k = out_item.get("key") or out_item.get("event_id") or ""
+                        m = re.match(r"^digest:(\d{4}-\d{2}-\d{2})", k)
+                        if m and m.group(1) < today_str:
+                            should_send = True
+                        elif out_item.get("created_at") and str(out_item["created_at"])[:10] < today_str:
+                            should_send = True
+                        else:
+                            cur.execute(
+                                "SELECT 1 FROM outbox_deliveries WHERE outbox_id = ? AND status IN ('sent', 'ambiguous') LIMIT 1",
+                                (out_item["id"],),
+                            )
+                            should_send = bool(cur.fetchone())
             if should_send:
                 unsent_pages = store.get_unsent_outbox_pages(conn, out_item["id"])
                 if unsent_pages:
@@ -290,21 +290,27 @@ def run_cycle(
                                 conn=conn,
                                 outbox_id=out_item["id"],
                             )
-                        if p_success:
+                        cur = conn.cursor()
+                        cur.execute("SELECT status FROM outbox_deliveries WHERE outbox_id = ? AND page_number = ?", (out_item["id"], p_num))
+                        d_statuses = [r[0] for r in cur.fetchall()]
+                        page_st = derive_status(d_statuses) if d_statuses else ("sent" if p_success else "failed")
+                        if page_st == "sent":
                             store.mark_outbox_page_sent(conn, out_item["id"], p_num)
                             if is_digest:
                                 digest_page_sent_today = True
-                        else:
-                            cur = conn.cursor()
-                            cur.execute("SELECT status FROM outbox_deliveries WHERE outbox_id = ? AND page_number = ?", (out_item["id"], p_num))
-                            d_statuses = {r[0] for r in cur.fetchall()}
-                            if "ambiguous" in d_statuses:
-                                store.mark_outbox_page_status(conn, out_item["id"], p_num, "ambiguous")
-                            else:
-                                store.mark_outbox_page_failed(conn, out_item["id"], p_num, p_err)
+                        elif page_st == "failed":
+                            store.mark_outbox_page_failed(conn, out_item["id"], p_num, p_err)
                             all_pages_sent = False
                             last_err = p_err
                             break
+                        else:
+                            store.mark_outbox_page_status(conn, out_item["id"], p_num, page_st)
+                            all_pages_sent = False
+                            if is_digest and p_success:
+                                digest_page_sent_today = True
+                            if not p_success:
+                                last_err = p_err
+                                break
                     if all_pages_sent and store.are_all_outbox_pages_sent(conn, out_item["id"]):
                         store.update_outbox_status(conn, out_item["id"], "sent")
                         _mark_outbox_done(conn, out_item["id"], out_item.get("key") or out_item["event_id"])
@@ -347,12 +353,14 @@ def run_cycle(
                             error_message=err,
                             next_attempt_at=next_at,
                         )
-                    if success:
+                    if success and out_cur_st != "ambiguous":
                         _mark_outbox_done(conn, out_item["id"], out_item.get("key") or out_item["event_id"])
                         if is_digest and not dry_run:
                             store.set_app_state(conn, "last_digest_date", today_str)
                             is_daily_due = False
                             digest_page_sent_today = True
+                    elif is_digest and success and not dry_run:
+                        digest_page_sent_today = True
 
         # Resume unfinished processing jobs independently of fetching
         unfinished_jobs = []
@@ -727,9 +735,12 @@ def run_cycle(
         # 6. Process digest (daily or --digest or --fixtures or --baseline-digest)
         digest_key = f"digest:{today_str}"
         existing_digest = store.get_outbox_by_key(conn, digest_key)
-        if digest_page_sent_today or store.was_digest_page_sent_today(conn, today_str):
+        already_sent_today = digest_page_sent_today or store.was_digest_page_sent_today(conn, today_str)
+        if already_sent_today:
             is_daily_due = False
-        should_send_digest = digest_mode or is_daily_due or (fixtures and digest_items) or (baseline_digest and baseline_digest_items)
+            should_send_digest = False
+        else:
+            should_send_digest = digest_mode or is_daily_due or (fixtures and digest_items) or (baseline_digest and baseline_digest_items)
 
         if should_send_digest and not existing_digest:
             all_for_digest = list(digest_items)
@@ -785,20 +796,26 @@ def run_cycle(
                             conn=conn,
                             outbox_id=out_id,
                         )
-                    if p_success:
+                    cur = conn.cursor()
+                    cur.execute("SELECT status FROM outbox_deliveries WHERE outbox_id = ? AND page_number = ?", (out_id, p_num))
+                    d_statuses = [r[0] for r in cur.fetchall()]
+                    page_st = derive_status(d_statuses) if d_statuses else ("sent" if p_success else "failed")
+                    if page_st == "sent":
                         store.mark_outbox_page_sent(conn, out_id, p_num)
                         digest_page_sent_today = True
-                    else:
-                        cur = conn.cursor()
-                        cur.execute("SELECT status FROM outbox_deliveries WHERE outbox_id = ? AND page_number = ?", (out_id, p_num))
-                        d_statuses = {r[0] for r in cur.fetchall()}
-                        if "ambiguous" in d_statuses:
-                            store.mark_outbox_page_status(conn, out_id, p_num, "ambiguous")
-                        else:
-                            store.mark_outbox_page_failed(conn, out_id, p_num, p_err)
+                    elif page_st == "failed":
+                        store.mark_outbox_page_failed(conn, out_id, p_num, p_err)
                         all_pages_sent = False
                         last_err = p_err
                         break
+                    else:
+                        store.mark_outbox_page_status(conn, out_id, p_num, page_st)
+                        all_pages_sent = False
+                        if p_success:
+                            digest_page_sent_today = True
+                        if not p_success:
+                            last_err = p_err
+                            break
 
                 if all_pages_sent and store.are_all_outbox_pages_sent(conn, out_id):
                     store.update_outbox_status(conn, out_id, "sent")
