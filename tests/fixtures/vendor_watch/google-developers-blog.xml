@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Google Developers Blog</title>
+  <id>https://developers.googleblog.com/</id>
+  <updated>2026-10-27T00:00:00Z</updated>
+  <entry>
+    <id>tag:googleblog.com,2026:post-101</id>
+    <title>Building next-generation agent workflows with Google Developer Tools</title>
+    <link rel="alternate" type="text/html" href="https://developers.googleblog.com/2026/10/next-gen-agents.html"/>
+    <published>2026-10-27T00:00:00Z</published>
+    <updated>2026-10-27T00:00:00Z</updated>
+    <content type="text">Overview of developer tools for multi-agent workflows and API access.</content>
+  </entry>
+  <entry>
+    <id>tag:googleblog.com,2026:post-100</id>
+    <title>Previous Developers Blog Post</title>
+    <link rel="alternate" type="text/html" href="https://developers.googleblog.com/2026/09/earlier-post.html"/>
+    <published>2026-09-01T00:00:00Z</published>
+    <updated>2026-09-01T00:00:00Z</updated>
+    <content type="text">Earlier developer blog details.</content>
+  </entry>
+</feed>

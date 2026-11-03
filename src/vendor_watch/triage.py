@@ -1,0 +1,472 @@
+"""Deterministic triage and deduplication clustering for vendor updates."""
+
+from datetime import datetime
+import re
+
+_SEMVER_RE = re.compile(r"(?:^|[\s/vV])(\d+)\.(\d+)\.(\d+)(?:[-.]([a-zA-Z0-9.]+))?")
+
+_DEPRECATION_KEYWORDS = (
+    "deprecat",
+    "shutdown",
+    "sunsetting",
+    "sunset",
+    "end of life",
+    "discontinued",
+    "retired",
+)
+
+_SECURITY_KEYWORDS = (
+    "cve-",
+    "vulnerability",
+    "security fix",
+    "security advisory",
+    "critical patch",
+    "auth bypass",
+    "rce",
+    "exploit",
+)
+
+_SECURITY_RE = re.compile(
+    r"\b(cve-[0-9a-z.-]+|vulnerabilit(?:y|ies)|security\s+fix(?:es)?|security\s+advisor(?:y|ies)|critical\s+patch(?:es)?|auth\s+bypass|rce|exploits?)\b",
+    re.IGNORECASE,
+)
+
+_SUPPORT_FOR_MODEL_RE = re.compile(
+    r"\b(?:add(?:ed|ing)?\s+support\s+for|supports?|support\s+for|integrat(?:ed|ing|ion\s+with))\s+(?:gpt|gemini|claude|opus|sonnet|haiku)",
+    re.IGNORECASE,
+)
+
+_BREAKING_KEYWORDS = (
+    "breaking change",
+    "breaking:",
+    "breaking ",
+    "backward incompatible",
+    "removed in v",
+    "migration guide",
+)
+
+_CUSTOMER_STORY_KEYWORDS = (
+    "is transforming",
+    "are transforming",
+    "transforming the",
+    "customer story",
+    "customer stories",
+    "case study",
+    "case studies",
+    "partner post",
+    "partner posts",
+    "partner story",
+    "partner stories",
+    "partner spotlight",
+    "customer spotlight",
+    "success story",
+    "success stories",
+)
+
+_CUSTOMER_STORY_RE = re.compile(
+    r"\bhow\s+[a-zA-Z0-9_\-.]+\s+(?:uses|is using|built|leverages|powers|accelerates|scales)\b",
+    re.IGNORECASE,
+)
+
+_MODEL_NAME_RE = re.compile(
+    r"\b(?:gpt-[0-9a-z.\-]+|gemini-[0-9a-z.\-]+|gemini\s+[0-9.]+|claude-[0-9a-z.\-]+|claude\s+[0-9.]+|opus\s+[0-9.]+|sonnet\s+[0-9.]+|haiku\s+[0-9.]+|argon|astra)\b",
+    re.IGNORECASE,
+)
+
+_MODEL_RELEASE_WORDING = (
+    "introducing",
+    "announcing",
+    "announces",
+    "release",
+    "releases",
+    "released",
+    "releasing",
+    "model release",
+    "new model",
+    "foundation model",
+    "frontier model",
+    "generally available",
+    "now available",
+    "launches",
+    "launched",
+    "launching",
+    "presents",
+    "unveils",
+    "unveiled",
+)
+
+_TUTORIAL_KEYWORDS = (
+    "best practice",
+    "best practices",
+    "tutorial",
+    "guide to",
+    "guide for",
+    "walkthrough",
+    "how to",
+    "how-to",
+    "sample code",
+    "tips for",
+    "fine-tuning best practices",
+    "getting started with",
+)
+
+
+_PRICING_KEYWORDS = (
+    "price reduction",
+    "pricing update",
+    "price drop",
+    "pricing:",
+    "cost per token",
+    "token pricing",
+    "billing update",
+)
+
+_FEATURE_KEYWORDS = (
+    "feature:",
+    "feat:",
+    "support for",
+    "new feature",
+    "added",
+    "introducing",
+)
+
+_PRERELEASE_KEYWORDS = (
+    "-alpha",
+    "-beta",
+    "-rc",
+    ".alpha",
+    ".beta",
+    ".rc",
+    "prerelease",
+    "pre-release",
+)
+
+SEVERITY_ORDER = {
+    "security": 100,
+    "breaking": 90,
+    "account_change": 85,
+    "deprecation": 80,
+    "new_model": 70,
+    "pricing": 60,
+    "feature": 50,
+    "sdk_patch": 40,
+    "other": 30,
+    "prerelease": 20,
+}
+
+
+def is_prerelease(
+    title: str,
+    text: str = "",
+    entry_id: str = "",
+    is_prerelease_flag: bool = False,
+) -> bool:
+    """Check if title, tag or GitHub flag indicates an alpha/beta/rc/preview pre-release.
+
+    Decide prerelease from tag, title, or GitHub prerelease flag, never from body text.
+    """
+    if is_prerelease_flag:
+        return True
+    target = f"{title} {entry_id}".lower()
+    match = _SEMVER_RE.search(title) or _SEMVER_RE.search(entry_id)
+    if match and match.group(4):
+        tag = match.group(4).lower()
+        if any(w in tag for w in ("alpha", "beta", "rc", "preview", "canary", "dev")):
+            return True
+    if any(k in target for k in ("-alpha", "-beta", "-rc", ".alpha", ".beta", ".rc")):
+        return True
+    return False
+
+
+def extract_semver(text: str) -> tuple[int, int, int] | None:
+    match = _SEMVER_RE.search(text)
+    if match:
+        try:
+            return int(match.group(1)), int(match.group(2)), int(match.group(3))
+        except ValueError:
+            return None
+    return None
+
+
+def classify_event(event: dict) -> tuple[str, str]:
+    """Determine (type, priority) from title, content, product name and SemVer.
+
+    Types: new_model | breaking | security | deprecation | pricing | feature | sdk_patch | other
+    Priority: high vs digest
+    """
+    title = (event.get("title") or "").lower()
+    entry_id = (event.get("entry_id") or "").lower()
+    raw = (event.get("raw_content") or event.get("summary") or "").lower()
+    full_text = f"{title}\n{raw}"
+    product = (event.get("product") or "").lower()
+    source_id = (event.get("source_id") or "").lower()
+
+    # Pre-releases are determined from title, entry_id, or GitHub prerelease flag (never from body text)
+    prerelease_flag = (
+        event.get("prerelease") is True
+        or is_prerelease(
+            title,
+            entry_id=entry_id,
+            is_prerelease_flag=bool(event.get("prerelease")),
+        )
+    )
+
+    # Pre-releases are noise unless security fixes / vulnerabilities
+    if prerelease_flag:
+        if bool(_SECURITY_RE.search(full_text)):
+            return "security", "high"
+        return "prerelease", "ignore"
+
+    # Customer stories, case studies and partner posts ("is transforming", "how X uses", "customer story") are at most digest.
+    # The customer-story / case-study cap applies before any high return.
+    is_customer_story = any(k in full_text for k in _CUSTOMER_STORY_KEYWORDS) or bool(_CUSTOMER_STORY_RE.search(full_text))
+    if is_customer_story:
+        if any(k in full_text for k in _FEATURE_KEYWORDS):
+            return "feature", "digest"
+        return "other", "digest"
+
+    # 1. Deprecation / shutdown -> always high for stable releases
+    if any(k in full_text for k in _DEPRECATION_KEYWORDS):
+        return "deprecation", "high"
+
+    # 2. Security fixes / vulnerabilities -> always high (matched with word boundaries)
+    if bool(_SECURITY_RE.search(full_text)):
+        return "security", "high"
+
+    # 3. Breaking changes (explicit keyword or SemVer major bump)
+    is_breaking_kw = False
+    if (
+        "no breaking" not in full_text
+        and "without breaking" not in full_text
+        and "non-breaking" not in full_text
+        and "not breaking" not in full_text
+    ):
+        is_breaking_kw = any(k in full_text for k in _BREAKING_KEYWORDS)
+    semver = extract_semver(title) or extract_semver(raw)
+
+    if is_breaking_kw:
+        return "breaking", "high"
+
+    if semver and not prerelease_flag:
+        major, minor, patch = semver
+        if major >= 2 and minor == 0 and patch == 0:
+            return "breaking", "high"
+
+    # 4. New model releases -> high only when release wording refers to the named model itself
+    # SDK releases (e.g. "added support for GPT-4o"), tutorials, dashboard/tool launches must NOT become new_model/high
+    is_sdk = "sdk" in product or "python" in product or "cli" in product or "sdk" in source_id or "client" in product
+    is_support_phrase = bool(_SUPPORT_FOR_MODEL_RE.search(full_text))
+    is_tutorial = any(k in title for k in _TUTORIAL_KEYWORDS)
+
+    is_model_release = False
+    if not is_sdk and not is_support_phrase and not is_tutorial:
+        clauses = re.split(r"[\n\.\?!;—–]+", full_text)
+        for clause in clauses:
+            clause = clause.strip()
+            if not clause:
+                continue
+            has_model = bool(_MODEL_NAME_RE.search(clause))
+            has_wording = any(k in clause for k in _MODEL_RELEASE_WORDING)
+            if has_model and has_wording:
+                if bool(_SUPPORT_FOR_MODEL_RE.search(clause)):
+                    continue
+                if any(k in clause for k in _TUTORIAL_KEYWORDS):
+                    continue
+                if any(w in clause for w in ("dashboard", "console", "playground", "portal")) and not any(
+                    w in clause for w in ("foundation model", "frontier model", "new model", "flagship model")
+                ):
+                    continue
+                is_model_release = True
+                break
+
+        if not is_model_release:
+            title_lower = title.strip().lower()
+            if bool(_MODEL_NAME_RE.search(title_lower)) and len(title_lower.split()) <= 4:
+                if not any(k in title_lower for k in _TUTORIAL_KEYWORDS):
+                    if any(
+                        k in full_text
+                        for k in (
+                            "new model",
+                            "foundation model",
+                            "frontier model",
+                            "now generally available",
+                            "is now available",
+                        )
+                    ):
+                        is_model_release = True
+
+    if is_model_release:
+        return "new_model", "high"
+
+    # 5. Pricing updates -> high
+    if any(k in full_text for k in _PRICING_KEYWORDS):
+        return "pricing", "high"
+
+    # 6. SDK patch releases -> digest unless security/breaking (handled above)
+    if is_sdk and semver:
+        _, _, patch = semver
+        if patch > 0:
+            return "sdk_patch", "digest"
+
+    # 7. Features
+    if any(k in full_text for k in _FEATURE_KEYWORDS) or is_support_phrase:
+        return "feature", "digest"
+
+    if semver and semver[2] > 0:
+        return "sdk_patch", "digest"
+
+    # 8. Fallback
+    return "other", "digest"
+
+
+def _extract_entity_key(title: str, text: str, product: str = "") -> str:
+    """Extract model or release key for cluster matching (e.g. gemini-2.5-flash, or product + v1.50.0)."""
+    normalized = re.sub(r"[\s\-_]+", "-", f"{title} {text}".lower())
+    # Check model names
+    models = (
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+        "gemini-3.8-flash",
+        "gemini-4-argon",
+        "gpt-6-astra",
+        "gpt-5",
+        "claude-opus-5.5",
+        "claude-sonnet-4",
+    )
+    for m in models:
+        if m in normalized:
+            return m
+
+    # Check semver (must include product in the key so different products don't accidentally merge)
+    sv = extract_semver(title) or extract_semver(text)
+    if sv:
+        prod_clean = re.sub(r"[\s\-_]+", "-", product.strip().lower())
+        if prod_clean:
+            return f"{prod_clean}:v{sv[0]}.{sv[1]}.{sv[2]}"
+        return f"v{sv[0]}.{sv[1]}.{sv[2]}"
+
+    return ""
+
+
+def _parse_time(ts_str: str) -> float:
+    try:
+        return datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def cluster_duplicates(events: list[dict]) -> list[dict]:
+    """Cluster duplicate events across sources (same vendor + model/product-version within 24h)."""
+    if len(events) <= 1:
+        return events
+
+    clusters: list[list[dict]] = []
+    for ev in events:
+        vendor = (ev.get("vendor") or "").strip().lower()
+        key = _extract_entity_key(ev.get("title", ""), ev.get("raw_content", ""), ev.get("product", ""))
+        t = _parse_time(ev.get("published_at", ""))
+
+        placed = False
+        if vendor and key:
+            for cluster in clusters:
+                first = cluster[0]
+                c_vendor = (first.get("vendor") or "").strip().lower()
+                c_key = _extract_entity_key(first.get("title", ""), first.get("raw_content", ""), first.get("product", ""))
+                c_t = _parse_time(first.get("published_at", ""))
+
+                if vendor == c_vendor and key == c_key:
+                    # Check 24 hour window
+                    if abs(t - c_t) <= 86400:
+                        cluster.append(ev)
+                        placed = True
+                        break
+
+        if not placed:
+            clusters.append([ev])
+
+    merged_events = []
+    for cluster in clusters:
+        if len(cluster) == 1:
+            ev = cluster[0]
+            if "links" not in ev:
+                ev["links"] = [ev["link"]] if ev.get("link") else []
+            if "member_ids" not in ev and ev.get("id"):
+                ev["member_ids"] = [ev["id"]]
+            if "member_items" not in ev and ev.get("id"):
+                ev["member_items"] = [(ev["id"], ev.get("revision", 1))]
+            if "member_revisions" not in ev and ev.get("id"):
+                ev["member_revisions"] = {ev["id"]: ev.get("revision", 1)}
+            merged_events.append(ev)
+        else:
+            # Merge cluster: keep all member content and the maximum severity
+            primary = cluster[0]
+            all_links = []
+            all_products = []
+            all_contents = []
+            best_type = primary.get("triage_type") or "other"
+            best_prio = primary.get("priority") or "digest"
+            if not primary.get("triage_type") or not primary.get("priority"):
+                best_type, best_prio = classify_event(primary)
+            max_severity = SEVERITY_ORDER.get(best_type, 10)
+
+            for item in cluster:
+                link = item.get("link")
+                if link and link not in all_links:
+                    all_links.append(link)
+                for l in item.get("links", []):
+                    if l and l not in all_links:
+                        all_links.append(l)
+
+                prod = item.get("product")
+                if prod and prod not in all_products:
+                    all_products.append(prod)
+
+                content = item.get("raw_content") or item.get("summary") or ""
+                if content and content not in all_contents:
+                    all_contents.append(content)
+
+                itype = item.get("triage_type")
+                iprio = item.get("priority")
+                if not itype or not iprio:
+                    itype, iprio = classify_event(item)
+                rank = SEVERITY_ORDER.get(itype, 10)
+                if rank > max_severity:
+                    max_severity = rank
+                    best_type = itype
+                    best_prio = iprio
+
+            member_items = []
+            member_revisions = {}
+            for item in cluster:
+                if not item.get("id"):
+                    continue
+                if "member_items" in item and item["member_items"]:
+                    for mid, mrev in item["member_items"]:
+                        if mid not in member_revisions:
+                            member_items.append((mid, mrev))
+                            member_revisions[mid] = mrev
+                elif "member_revisions" in item and item["member_revisions"]:
+                    for mid, mrev in item["member_revisions"].items():
+                        if mid not in member_revisions:
+                            member_items.append((mid, mrev))
+                            member_revisions[mid] = mrev
+                else:
+                    mid = item["id"]
+                    mrev = item.get("revision", 1)
+                    if mid not in member_revisions:
+                        member_items.append((mid, mrev))
+                        member_revisions[mid] = mrev
+
+            merged = dict(primary)
+            merged["member_items"] = member_items
+            merged["member_revisions"] = member_revisions
+            merged["member_ids"] = [mid for mid, _ in member_items]
+            merged["links"] = all_links
+            merged["clustered_sources"] = all_products
+            merged["cluster_count"] = len(cluster)
+            merged["raw_content"] = "\n\n---\n\n".join(all_contents) if all_contents else primary.get("raw_content", "")
+            merged["triage_type"] = best_type
+            merged["priority"] = best_prio
+            merged_events.append(merged)
+
+    return merged_events

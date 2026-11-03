@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>anthropic-claude-code releases</title>
+  <id>https://github.com/anthropics/claude-code/releases</id>
+  <updated>2026-10-28T00:00:00Z</updated>
+  <entry>
+    <id>tag:github.com,2008:Repository/123/v2.0.0</id>
+    <title>Claude Code 2.0 with Opus 5.5 Support - Major Release</title>
+    <link rel="alternate" type="text/html" href="https://github.com/anthropics/claude-code/releases/tag/v2.0.0"/>
+    <published>2026-10-28T00:00:00Z</published>
+    <updated>2026-10-28T00:00:00Z</updated>
+    <content type="text">Major release introducing Claude Opus 5.5 support in Claude Code. Includes new architectural design tools and deep module debugging. Breaking changes: configuration schema migrated to v2 format. Install with `npm install -g @anthropic-ai/claude-code@latest`.</content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Repository/123/v1.9.0</id>
+    <title>Claude Code v1.9.0</title>
+    <link rel="alternate" type="text/html" href="https://github.com/anthropics/claude-code/releases/tag/v1.9.0"/>
+    <published>2026-10-15T00:00:00Z</published>
+    <updated>2026-10-15T00:00:00Z</updated>
+    <content type="text">Minor improvements and bug fixes.</content>
+  </entry>
+</feed>

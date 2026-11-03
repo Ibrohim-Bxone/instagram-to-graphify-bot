@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Google DeepMind Blog</title>
+    <link>https://blog.google/technology/google-deepmind/</link>
+    <description>News and stories from Google DeepMind</description>
+    <item>
+      <title>Frontiers of AI Reasoning and Multi-Agent Systems</title>
+      <link>https://blog.google/technology/google-deepmind/ai-reasoning-oct-2026/</link>
+      <guid>https://blog.google/technology/google-deepmind/ai-reasoning-oct-2026/</guid>
+      <pubDate>Mon, 26 Oct 2026 00:00:00 GMT</pubDate>
+      <description>Research overview detailing scientific breakthroughs in autonomous agent coordination.</description>
+    </item>
+    <item>
+      <title>AlphaFold Ecosystem Updates</title>
+      <link>https://blog.google/technology/google-deepmind/alphafold-update/</link>
+      <guid>https://blog.google/technology/google-deepmind/alphafold-update/</guid>
+      <pubDate>Tue, 01 Sep 2026 00:00:00 GMT</pubDate>
+      <description>AlphaFold updates for biological researchers.</description>
+    </item>
+  </channel>
+</rss>

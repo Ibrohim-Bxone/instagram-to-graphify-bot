@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Google Gemini Blog</title>
+    <link>https://blog.google/products/gemini/</link>
+    <description>Updates about Google Gemini</description>
+    <item>
+      <title>Gemini 2.5 Flash updates and performance</title>
+      <link>https://blog.google/products/gemini/gemini-2-5-flash-ga/</link>
+      <guid>https://blog.google/products/gemini/gemini-2-5-flash-ga/</guid>
+      <pubDate>Wed, 28 Oct 2026 00:00:00 GMT</pubDate>
+      <description>Announcing Gemini 2.5 Flash with superior speed and multimodal coding performance.</description>
+    </item>
+    <item>
+      <title>Gemini App Features</title>
+      <link>https://blog.google/products/gemini/gemini-app-oct/</link>
+      <guid>https://blog.google/products/gemini/gemini-app-oct/</guid>
+      <pubDate>Thu, 01 Oct 2026 00:00:00 GMT</pubDate>
+      <description>Gemini App productivity updates.</description>
+    </item>
+  </channel>
+</rss>
